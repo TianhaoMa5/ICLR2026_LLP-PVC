@@ -353,6 +353,7 @@ def coeff_product_fast_norm(p_c_batch: torch.Tensor):
 # 3) Single-bag CC loss (IMPORTANT: no "+1e-12" smoothing)
 # ============================================================
 def compute_CC_loss_fft_precise(
+        args,
     softmax_p: torch.Tensor,      # [s, C] probabilities
     proportions: torch.Tensor,    # [C] assumed correct
 ) -> torch.Tensor:
@@ -379,7 +380,7 @@ def compute_CC_loss_fft_precise(
     coeffs, log_sc = coeff_product_fast_norm(p)  # [C, s+1], [C]
 
     # IMPORTANT: do NOT add 1e-12 here (kills gradients for s=128)
-    coeffs_pos = coeffs.clamp_min(1e-30)  # only fix tiny negatives from FFT noise
+    coeffs_pos = coeffs.clamp_min(args.eps)  # only fix tiny negatives from FFT noise
 
     log_coeffs = torch.log(coeffs_pos) + log_sc.unsqueeze(1)  # [C, s+1]
 
@@ -399,6 +400,7 @@ def compute_CC_loss_fft_precise(
 # 4) Batched wrapper
 # ============================================================
 def compute_CC_loss_fft_precise_batched(
+    args,
     softmax_p_batch: torch.Tensor,     # [B, s, C]
     proportions_batch: torch.Tensor,   # [B, C]
     reduce: Optional[str] = "mean",    # "mean" recommended
@@ -678,7 +680,7 @@ samp_ran
         proportion =proportion .view (length ,n_classes ,1 )
         proportion =proportion .squeeze (-1 )
         proportion =proportion .double ()
-        loss =compute_CC_loss_fft_precise_batched (labels_p_batch ,proportion ,reduce ="mean")
+        loss =compute_CC_loss_fft_precise_batched (args,labels_p_batch ,proportion ,reduce ="mean")
 
         #loss =compute_CC_loss_fft_precise_batched_varlen (labels_p_batch ,proportion ,reduce ="mean")
         #loss =compute_CC_loss_dp_precise_batched (labels_p_batch ,proportion ,reduce ="mean")
@@ -875,8 +877,8 @@ def main ():
     help ='c oefficient of unlabeled loss')
     parser .add_argument ('--lr',type =float ,default= 2.5e-3 ,
     help ='learning rate for training')
-    parser .add_argument ('--weight-decay',type =float ,default =5e-5 ,
-    help ='weight decay')
+    parser.add_argument('--eps', type=float, default=1e-30,
+                        help='numerical stability epsilon')
     parser .add_argument ('--momentum',type =float ,default =0.9 ,
     help ='momentum for optimizer')
     parser .add_argument ('--seed',type =int ,default =13 ,
