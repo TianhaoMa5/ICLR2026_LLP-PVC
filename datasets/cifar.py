@@ -10,6 +10,7 @@ from torchvision import transforms
 from collections import Counter, OrderedDict
 import h5py
 from MLclf import MLclf
+from collections import defaultdict
 
 from datasets import tran as T
 from datasets.rand import RandomAugment
@@ -22,7 +23,7 @@ import pickle
 import os
 from PIL import Image
 
-label_map = {}  # 用于映射原始标签到连续整数的字典
+label_map = {}
 class_mapping={}
 
 
@@ -30,81 +31,85 @@ def extract_labels_from_class_dict(class_dict):
     for class_idx, image_indices in enumerate(class_dict.values()):
         for image_index in image_indices:
             label_map[image_index] = class_idx
-    # 为了保证顺序，我们根据图像索引排序
     sorted_label_map = dict(sorted(label_map.items()))
-    # 现在我们可以得到一个与图像一一对应的标签列表
     labels = list(sorted_label_map.values())
     return labels
 
 
 def load_mini_imagenet_data(dspth, split='train'):
-    """
-    加载 Mini-ImageNet 数据集。
 
-    参数:
-    - dspth: 数据集的路径
-    - split: 'train', 'val', 'test' 对应不同的数据集部分
-
-    返回:
-    - data: 图像数据
-    - labels: 标签数据
-    """
     if split == 'train':
-        pkl_file = osp.join(dspth, 'mini-imagenet-cache-train.pkl')
+        pkl_file = osp.join(dspth, 'miniimagenet/mini-imagenet-cache-train.pkl')
     elif split == 'val':
-        pkl_file = osp.join(dspth, 'mini-imagenet-cache-val.pkl')
+        pkl_file = osp.join(dspth, 'miniimagenet/mini-imagenet-cache-val.pkl')
     elif split == 'test':
-        pkl_file = osp.join(dspth, 'mini-imagenet-cache-test.pkl')
+        pkl_file = osp.join(dspth, 'miniimagenet/mini-imagenet-cache-test.pkl')
     else:
         raise ValueError("无效的 split 参数，应为 'train', 'val' 或 'test'")
 
-    # 读取 .pkl 文件
     with open(pkl_file, 'rb') as f:
         data_dict = pickle.load(f)
 
-    # 从数据字典中获取图像和标签
-    data = data_dict['image_data']  # 图像数据
-    labels = data_dict['class_dict']  # 类别标签
-
+    data = data_dict['image_data']
+    labels = data_dict['class_dict']
     return data, labels
 
+import numpy as np
 
 def merge_train_val_test(dspth):
     """
-    加载并合并 Mini-ImageNet 数据集的训练集、验证集和测试集，并确保相同类别名称的标签保持一致。
-
-    参数:
-    - dspth: 数据集的路径
-
-    返回:
-    - merged_data: 合并后的图像数据
-    - merged_labels: 合并后的标签数据
+    把 Mini-ImageNet 的 train/val/test 合并；
+    支持 labels 为：
+      1) dict: {class_name: [sample_indices_in_split, ...]}
+      2) list/array: [class_name_or_id_per_sample, ...]
+    返回：
+      merged_data: 按 train→val→test 拼接后的数据
+      merged_labels: 与 merged_data 一一对齐的稳定数值标签（相同输入→相同输出）
     """
-    # 加载训练集、验证集和测试集
     train_data, train_labels = load_mini_imagenet_data(dspth, split='train')
-    val_data, val_labels = load_mini_imagenet_data(dspth, split='val')
-    test_data, test_labels = load_mini_imagenet_data(dspth, split='test')
+    val_data,   val_labels   = load_mini_imagenet_data(dspth, split='val')
+    test_data,  test_labels  = load_mini_imagenet_data(dspth, split='test')
 
-    # 合并数据
-    merged_data = np.concatenate([train_data, val_data, test_data], axis=0)
+    # ---------- 1) 稳定的类别到ID映射 ----------
+    def collect_classes(lbl):
+        if isinstance(lbl, dict):
+            return {str(k) for k in lbl.keys()}
+        else:
+            return {str(x) for x in (lbl.tolist() if hasattr(lbl, "tolist") else list(lbl))}
+    all_classes = sorted(collect_classes(train_labels) |
+                         collect_classes(val_labels)   |
+                         collect_classes(test_labels))     # 排序=稳定
+    cls2id = {c: i for i, c in enumerate(all_classes)}     # 稳定映射
 
-    # 创建类别映射，确保相同 key 的类别标签相同
-    class_mapping = {}  # 用于存储每个类别的唯一标签
-    class_label = 0  # 初始化标签计数器
-    merged_labels = [None] * len(merged_data)  # 初始化标签列表，None表示还未分配标签
-    m_labels={**test_labels, **train_labels, **val_labels}
-    # 合并 train, val, test 的 labels 并设置相同 key 的标签相同
-    new_labels = {key: idx for idx, key in enumerate(m_labels.keys())}
-    sample_labels = []
+    # ---------- 2) 把每个 split 还原成“样本级标签数组” ----------
+    def to_per_sample_labels(data_split, labels_split):
+        n = len(data_split)
+        if isinstance(labels_split, dict):
+            y = np.empty(n, dtype=np.int64)
+            # 安全性：索引必须在 [0, n)
+            for c, idxs in labels_split.items():
+                idxs = np.asarray(idxs, dtype=np.int64)
+                assert idxs.ndim == 1, f"indices dim error for class {c}"
+                assert idxs.size > 0, f"empty indices for class {c}"
+                assert idxs.min() >= 0 and idxs.max() < n, \
+                    f"indices out of range for split: max={idxs.max()} n={n}"
+                y[idxs] = cls2id[str(c)]
+            return y
+        else:
+            # 已是一一对齐的标签列表/数组
+            arr = labels_split.tolist() if hasattr(labels_split, "tolist") else list(labels_split)
+            assert len(arr) == n, f"labels length {len(arr)} != data length {n}"
+            return np.fromiter((cls2id[str(c)] for c in arr), dtype=np.int64, count=n)
 
-    # Iterate over the m_labels dictionary and assign the label to each sample
-    for key, samples in m_labels.items():
-        label = new_labels[key]  # Get the label for the current key
-        sample_labels.extend([label] * len(samples))
+    y_train = to_per_sample_labels(train_data, train_labels)
+    y_val   = to_per_sample_labels(val_data,   val_labels)
+    y_test  = to_per_sample_labels(test_data,  test_labels)
 
-    return merged_data, sample_labels
+    # ---------- 3) 按相同顺序拼接数据与标签 ----------
+    merged_data   = np.concatenate([train_data, val_data, test_data], axis=0)
+    merged_labels = np.concatenate([y_train,    y_val,   y_test],     axis=0)
 
-
+    return merged_data, merged_labels
 
 def load_tiny_imagenet_val(root, image_size=(64, 64)):
     datalist = []
@@ -228,7 +233,38 @@ class ThreeCropsTransform:
 
 
 def load_data_train(num_classes, dataset='CIFAR10', dspth='./data', bagsize=16):
-    if dataset == 'CIFAR10':
+    input_dim=1
+    if dataset == 'Corel16k':
+        # Corel16k 有 10 个子集（001–010）
+        datalist = [osp.join(dspth, f'Corel16k{idx:03d}-train.arff')
+                    for idx in range(1, 11)]
+        n_class = 374  # Corel 系列常用 374 标签
+    elif dataset == 'Corel5k':
+        datalist = [osp.join(dspth, 'Corel5k-train.arff')]
+        n_class = 374
+    elif dataset == 'Delicious':
+        datalist = [osp.join(dspth, 'delicious-train.arff')]
+        n_class = 983
+    elif dataset == 'Bookmarks':
+        datalist = [osp.join(dspth, 'bookmarks.arff')]  # bookmarks 只有一个 ARFF
+        n_class = 208
+    elif dataset == 'Eurlex_DC':
+        # 10-fold 划分的 Directory-Codes 版本
+        datalist = [osp.join(dspth,
+                             f'eurlex-dc-leaves-fold{i}-train.arff') for i in range(1, 11)]
+        n_class = 201  # Eurlex-DC (leaves) 共有 201 类
+    elif dataset == 'Eurlex_SM':
+        # 10-fold 划分的 Subject-Matters 版本
+        datalist = [osp.join(dspth,
+                             f'eurlex-sm-fold{i}-train.arff') for i in range(1, 11)]
+        n_class = 281  # Eurlex-SM 共有 281 类
+    elif dataset == 'Scene':
+        datalist = [osp.join(dspth, 'scene-train.arff')]
+        n_class = 6
+    elif dataset == 'Yeast':
+        datalist = [osp.join(dspth, 'yeast-train.arff')]
+        n_class = 14
+    elif dataset == 'CIFAR10':
         datalist = [
             osp.join(dspth, 'cifar-10-batches-py', 'data_batch_{}'.format(i + 1))
             for i in range(5)
@@ -254,19 +290,17 @@ def load_data_train(num_classes, dataset='CIFAR10', dspth='./data', bagsize=16):
         data, labels = [], []
         datalist = [
             osp.join(dspth, 'KMNIST', 'raw', 'train-images-idx3-ubyte'),
-            osp.join(dspth, 'KMNIST', 'raw', 't10k-images-idx3-ubyte')  # 包含训练和测试集
         ]
         labelslist = [
             osp.join(dspth, 'KMNIST', 'raw', 'train-labels-idx1-ubyte'),
-            osp.join(dspth, 'KMNIST', 'raw', 't10k-labels-idx1-ubyte')  # 包含训练和测试集
         ]
         n_class = 10
     elif dataset == 'EMNISTBalanced':
         data, labels = [], []
         # 更新文件路径以指向EMNIST Balanced数据集的文件
-        datalist = [osp.join(dspth, 'EMNIST','raw', 'emnist-balanced-train-images-idx3-ubyte')]
-        labelslist = [osp.join(dspth, 'EMNIST','raw', 'emnist-balanced-train-labels-idx1-ubyte')]
-        n_class = 47
+        datalist = [osp.join(dspth, 'EMNIST','raw', 'emnist-letters-train-images-idx3-ubyte')]
+        labelslist = [osp.join(dspth, 'EMNIST','raw', 'emnist-letters-train-labels-idx1-ubyte')]
+        n_class = 26
     elif dataset == 'AGNEWS':
         data, labels = [], []
         datalist = [
@@ -309,6 +343,10 @@ def load_data_train(num_classes, dataset='CIFAR10', dspth='./data', bagsize=16):
                 labels.append(lbs)
         data = np.concatenate(data, axis=0)
         labels = np.concatenate(labels, axis=0)
+        if n_class == 2:
+            # 机器类映射为 1，其余为 0
+            machine_classes = np.array([0, 1, 8, 9])
+            labels = np.isin(labels, machine_classes).astype(np.int64)
     elif dataset in ['MNIST']:
         for data_path, label_path in zip(datalist, labelslist):
             with open(data_path, 'rb') as fr_data, open(label_path, 'rb') as fr_label:
@@ -351,22 +389,68 @@ def load_data_train(num_classes, dataset='CIFAR10', dspth='./data', bagsize=16):
 
         data = np.concatenate(data, axis=0)
         labels = np.concatenate(labels, axis=0)
+        labels = labels % 26
     elif dataset == 'TinyImageNet':
         data=train_data
         labels=train_labels
     elif dataset == 'miniImageNet':
         data = train_data
         labels = train_labels
+    elif dataset in [
+            'Corel16k',  # 10 × Corel16kXXX-train.arff
+            'Corel5k',
+            'Delicious',
+            'Bookmarks',
+            'Eurlex_DC',  # eurlex-dc-leaves-fold*-train.arff
+            'Eurlex_SM',  # eurlex-sm-fold*-train.arff
+            'Scene',
+            'Yeast'
+        ]:
+        import pandas as pd
+        from scipy.io import arff
+
+        data_parts, label_parts = [], []
+
+        # -------- 1. 逐文件读入 --------
+        for arff_path in datalist:
+            raw, _ = arff.loadarff(arff_path)
+            df = pd.DataFrame(raw)
+
+            X_part = df.iloc[:, :-n_class].values.astype(np.float32)  # 特征
+            Y_part = (df.iloc[:, -n_class:]
+                      .applymap(lambda x: int(x.decode() if isinstance(x, bytes) else x))
+                      .values.astype(np.int32))  # 多热标签
+
+            data_parts.append(X_part)
+            label_parts.append(Y_part)
+
+        data = np.concatenate(data_parts, axis=0)  # [N, D]
+        labels = np.concatenate(label_parts, axis=0)  # [N, K]
+
+        # -------- 2. 过滤低频标签 --------
+        if labels.shape[1] > 15:  # 只在标签数 > 15 时执行
+            freq = labels.sum(axis=0)  # 每个标签出现次数
+            keep_idx = np.argsort(freq)[::-1][:15]  # 取出现频次最高的 15 个
+            remove_idx = np.setdiff1d(np.arange(labels.shape[1]), keep_idx)
+
+            # (i) 删除在被移除标签上有正标记的样本
+            mask_samples = (labels[:, remove_idx].sum(axis=1) == 0)
+            data = data[mask_samples]
+            labels = labels[mask_samples]
+
+            # (ii) 只保留 15 列标签
+            labels = labels[:, keep_idx]
+
+        n_class = labels.shape[1]
+        input_dim = data.shape[1]
+
     elif dataset == 'AGNEWS':
         for data_path in datalist:
             with open(data_path, 'r', encoding='utf-8') as fr:
                 df = pd.read_csv(fr, header=None, names=["Class", "Title", "Description"])
-                # 合并标题和描述
                 data.append((df["Title"] + " " + df["Description"]).tolist())
-                # 标签调整为从 0 开始
                 labels.append((df["Class"] - 1).tolist())
 
-        # 将列表数据拼接为单个数组
         data = np.concatenate(data, axis=0)
         labels = np.concatenate(labels, axis=0)
 
@@ -376,14 +460,12 @@ def load_data_train(num_classes, dataset='CIFAR10', dspth='./data', bagsize=16):
     random_indices = np.arange(data_length)
     np.random.shuffle(random_indices)
 
-    # 使用随机索引对 data 和 labels 进行打乱
     data = data[random_indices]
     labels = labels[random_indices]
     data_u, label_prob = [], []
     labels_real = []
     labels_idx = []
 
-    # 使用np.arange生成初始索引序列，数量等于data的长度
     indices = np.arange(data_length)
 
     np.random.shuffle(indices)
@@ -396,6 +478,18 @@ def load_data_train(num_classes, dataset='CIFAR10', dspth='./data', bagsize=16):
         elif dataset == 'SVHN':
             bag_data = [data[i] for i in bag_indices]
         elif dataset == 'TinyImageNet':
+            bag_data = [data[i] for i in bag_indices]
+        elif dataset in [
+            'Corel16k',
+            'Corel5k',
+            'Delicious',
+            'Bookmarks',
+            'Eurlex_DC',
+            'Eurlex_SM',
+            'Scene',
+            'Yeast'
+        ]:
+
             bag_data = [data[i] for i in bag_indices]
         elif dataset == 'miniImageNet':
             bag_data = [data[i] for i in bag_indices]
@@ -410,7 +504,7 @@ def load_data_train(num_classes, dataset='CIFAR10', dspth='./data', bagsize=16):
         data_u.append(bag_data)
         indices_u.append(j)
         label_prob.append(label_proportions)
-    return data_u, label_prob, labels_real ,labels_idx,dataset_length,indices_u
+    return data_u, label_prob, labels_real ,labels_idx,dataset_length,indices_u,input_dim
 
 
 
@@ -423,6 +517,31 @@ def load_data_val(dataset, dspth='./data',n_classes=10):
         datalist = [
             osp.join(dspth, 'cifar-100-python', 'test')
         ]
+    elif dataset == 'Corel16k':
+        datalist = [osp.join(dspth, f'Corel16k{idx:03d}-test.arff')
+                    for idx in range(1, 11)]  # 一共有 10 个子集
+    elif dataset == 'Corel5k':
+        datalist = [osp.join(dspth, 'Corel5k-test.arff')]
+
+    elif dataset == 'Delicious':
+        datalist = [osp.join(dspth, 'delicious-test.arff')]
+
+    elif dataset == 'Bookmarks':
+        datalist = [osp.join(dspth, 'bookmarks.arff')]  # 原数据即 train+test，若你有拆分请自行替换
+
+    elif dataset == 'Eurlex_DC':
+        datalist = [osp.join(dspth,
+                             f'eurlex-dc-leaves-fold{i}-test.arff') for i in range(1, 11)]
+
+    elif dataset == 'Eurlex_SM':
+        datalist = [osp.join(dspth,
+                             f'eurlex-sm-fold{i}-test.arff') for i in range(1, 11)]
+
+    elif dataset == 'Scene':
+        datalist = [osp.join(dspth, 'scene-test.arff')]
+
+    elif dataset == 'Yeast':
+        datalist = [osp.join(dspth, 'yeast-test.arff')]
     elif dataset == 'SVHN':
         data, labels= load_svhn_val(dspth)
     elif dataset == "TinyImageNet":
@@ -462,11 +581,16 @@ def load_data_val(dataset, dspth='./data',n_classes=10):
             el.reshape(3, 32, 32).transpose(1, 2, 0)
             for el in data
         ]
+
+        if n_classes == 2:
+            # 机器类映射为 1，其余为 0
+            machine_classes = np.array([0, 1, 8, 9])
+            labels = np.isin(labels, machine_classes).astype(np.int64)
     elif dataset == 'MNIST':
         data, labels = [], []
         datalist = [osp.join(dspth, 'MNIST', 'raw', 't10k-images-idx3-ubyte')]
         labelslist = [osp.join(dspth, 'MNIST', 'raw', 't10k-labels-idx1-ubyte')]
-        n_class = n_classes
+        n_class = 2
         for data_path, label_path in zip(datalist, labelslist):
             with open(data_path, 'rb') as fr_data, open(label_path, 'rb') as fr_label:
                 fr_data.read(16)  # Skip the header
@@ -516,13 +640,129 @@ def load_data_val(dataset, dspth='./data',n_classes=10):
             for el in data
         ]
 
+    elif dataset in [
+        'Corel16k',  # Corel16kXXX-train/test.arff
+        'Corel5k',
+        'Delicious',
+        'Bookmarks',
+        'Eurlex_DC',  # eurlex-dc-leaves-fold*-train/test.arff
+        'Eurlex_SM',  # eurlex-sm-fold*-train/test.arff
+        'Scene',
+        'Yeast'
+    ]:
+        import pandas as pd
+        from scipy.io import arff
+
+        # --------------------------------------------------
+        # 0⃣  先给出 **train** / **test** 文件列表
+        #     —— 与训练那段逻辑保持完全一致 ——
+        # --------------------------------------------------
+        if dataset == 'Corel16k':
+            train_datalist = [osp.join(dspth, f'Corel16k{idx:03d}-train.arff')
+                              for idx in range(1, 11)]
+            test_datalist = [osp.join(dspth, f'Corel16k{idx:03d}-test.arff')
+                             for idx in range(1, 11)]
+            n_class = 374
+        elif dataset == 'Corel5k':
+            train_datalist = [osp.join(dspth, 'Corel5k-train.arff')]
+            test_datalist = [osp.join(dspth, 'Corel5k-test.arff')]
+            n_class = 374
+        elif dataset == 'Delicious':
+            train_datalist = [osp.join(dspth, 'delicious-train.arff')]
+            test_datalist = [osp.join(dspth, 'delicious-test.arff')]
+            n_class = 983
+        elif dataset == 'Bookmarks':
+            train_datalist = test_datalist = [osp.join(dspth, 'bookmarks.arff')]
+            n_class = 208
+        elif dataset == 'Eurlex_DC':
+            train_datalist = [osp.join(dspth, f'eurlex-dc-leaves-fold{i}-train.arff')
+                              for i in range(1, 11)]
+            test_datalist = [osp.join(dspth, f'eurlex-dc-leaves-fold{i}-test.arff')
+                             for i in range(1, 11)]
+            n_class = 201
+        elif dataset == 'Eurlex_SM':
+            train_datalist = [osp.join(dspth, f'eurlex-sm-fold{i}-train.arff')
+                              for i in range(1, 11)]
+            test_datalist = [osp.join(dspth, f'eurlex-sm-fold{i}-test.arff')
+                             for i in range(1, 11)]
+            n_class = 281
+        elif dataset == 'Scene':
+            train_datalist = [osp.join(dspth, 'scene-train.arff')]
+            test_datalist = [osp.join(dspth, 'scene-test.arff')]
+            n_class = 6
+        elif dataset == 'Yeast':
+            train_datalist = [osp.join(dspth, 'yeast-train.arff')]
+            test_datalist = [osp.join(dspth, 'yeast-test.arff')]
+            n_class = 14
+
+        # --------------------------------------------------
+        # 1⃣  读取 **训练集**，统计出现频次 → keep_idx
+        # --------------------------------------------------
+        tr_X_parts, tr_Y_parts = [], []
+
+        for p in train_datalist:
+            raw, _ = arff.loadarff(p)
+            df = pd.DataFrame(raw)
+
+            X = df.iloc[:, :-n_class].values.astype(np.float32)
+            Y = (df.iloc[:, -n_class:]
+                 .applymap(lambda z: int(z.decode() if isinstance(z, bytes) else z))
+                 .values.astype(np.int32))
+
+            tr_X_parts.append(X)
+            tr_Y_parts.append(Y)
+
+        data = np.concatenate(tr_X_parts, axis=0)
+        labels = np.concatenate(tr_Y_parts, axis=0)
+
+        if labels.shape[1] > 15:  # 只有标签数 >15 时才裁剪
+            freq = labels.sum(axis=0)  # 每列出现次数
+            keep_idx = np.argsort(freq)[::-1][:15]  # 前 15 高频标签
+            remove_idx = np.setdiff1d(np.arange(labels.shape[1]), keep_idx)
+
+            mask_tr = (labels[:, remove_idx].sum(axis=1) == 0)
+            data = data[mask_tr]
+            labels = labels[mask_tr][:, keep_idx]
+        else:
+            keep_idx = np.arange(labels.shape[1])  # 全保留
+
+        # -------- 更新维度信息 --------
+        input_dim = data.shape[1]
+        n_class = labels.shape[1]  # ≤15
+
+        # 到这里：data / labels 即 **训练集**，已满足论文要求
+
+        # --------------------------------------------------
+        # 2⃣  读取 **测试集**，用同一个 keep_idx 同步裁剪
+        # --------------------------------------------------
+        te_X_parts, te_Y_parts = [], []
+        rem_idx = np.setdiff1d(np.arange(n_class if len(keep_idx) == n_class else max(keep_idx) + 1), keep_idx)
+
+        for p in test_datalist:
+            raw, _ = arff.loadarff(p)
+            df = pd.DataFrame(raw)
+
+            X_full = df.iloc[:, :-n_class].values.astype(np.float32)
+            Y_full = (df.iloc[:, -n_class:]
+                      .applymap(lambda z: int(z.decode() if isinstance(z, bytes) else z))
+                      .values.astype(np.int32))
+
+            mask_te = (Y_full[:, rem_idx].sum(axis=1) == 0) if len(rem_idx) else np.ones(len(Y_full), bool)
+            X_keep = X_full[mask_te]
+            Y_keep = Y_full[mask_te][:, keep_idx]
+
+            te_X_parts.append(X_keep)
+            te_Y_parts.append(Y_keep)
+
+        data = np.concatenate(te_X_parts, axis=0)
+        labels = np.concatenate(te_Y_parts, axis=0)
 
     elif dataset == 'EMNISTBalanced':
         data, labels = [], []
         # 更新为EMNIST Balanced数据集的文件路径
-        datalist = [osp.join(dspth, 'EMNIST', 'raw', 'emnist-balanced-test-images-idx3-ubyte')]
-        labelslist = [osp.join(dspth, 'EMNIST', 'raw', 'emnist-balanced-test-labels-idx1-ubyte')]
-        n_class = 47  # EMNIST Balanced有47个类别
+        datalist = [osp.join(dspth, 'EMNIST', 'raw', 'emnist-letters-test-images-idx3-ubyte')]
+        labelslist = [osp.join(dspth, 'EMNIST', 'raw', 'emnist-letters-test-labels-idx1-ubyte')]
+        n_class = 26  # EMNIST Balanced有47个类别
 
         for data_path, label_path in zip(datalist, labelslist):
             with open(data_path, 'rb') as fr_data, open(label_path, 'rb') as fr_label:
@@ -534,7 +774,7 @@ def load_data_val(dataset, dspth='./data',n_classes=10):
         data = np.concatenate(data, axis=0)
         labels = np.concatenate(labels, axis=0)
         data = [el.reshape(28, 28) for el in data]  # 将每个样本重塑为28x28
-
+        labels = labels % 26
     return data, labels
 
 def load_svhn_val(dspth='./data/svhn'):
@@ -669,12 +909,12 @@ class Cifar(Dataset):
         elif dataset in ['MNIST','EMNISTBalanced']:
             trans_weak = T.Compose([
                 T1.Resize((28, 28)),
-                T1.PadandRandomCrop(border=4, cropsize=(28, 28)),
-                T1.RandomAffine(
-                    degrees=15,  # +/- 5度的旋转
-                    translate=(0.1, 0.1),  # 最多10%的水平和垂直平移
-                    scale_range=(0.9, 1.1)  # 0.9到1.1倍的缩放
-                ),
+                #T1.PadandRandomCrop(border=4, cropsize=(28, 28)),
+                #T1.RandomAffine(
+                #    degrees=15,  # +/- 5度的旋转
+                #    translate=(0.1, 0.1),  # 最多10%的水平和垂直平移
+                #    scale_range=(0.9, 1.1)  # 0.9到1.1倍的缩放
+                #),
                 T1.Normalize(mean, std),
                 transforms.ToTensor(),
             ])
@@ -759,6 +999,22 @@ class Cifar(Dataset):
                 transforms.ToTensor(),
                 transforms.Normalize(mean, std),
             ])
+        elif dataset in [
+            'Corel16k', 'Corel5k', 'Delicious', 'Bookmarks',
+            'Eurlex_DC', 'Eurlex_SM', 'Scene', 'Yeast'
+        ]:
+            # 这些数据集本身就是已提取好的扁平特征向量，
+            # 在训练前不需要任何数据增强或归一化。
+            trans_weak = T.Compose([
+                T.ToTensor(),  # ← 只是把 ndarray → FloatTensor
+            ])
+            trans_strong0 = T.Compose([
+                T.ToTensor(),  # 强弱同样：啥也不干
+            ])
+            trans_strong1 = T.Compose([
+                T.ToTensor(),
+            ])
+
         if self.mode == 'train_x':
             self.trans = trans_weak
         elif self.mode == 'train_u_DLLP':
@@ -903,7 +1159,7 @@ class SVHN(Dataset):
 
 
 def get_train_loader(classes,dataset, batch_size, bag_size, root='data', method='co',supervised=False):
-    data_u, label_prob, labels,label_idx,dataset_length,indices_u = load_data_train(classes, dataset=dataset, dspth=root, bagsize=bag_size)
+    data_u, label_prob, labels,label_idx,dataset_length,indices_u,input_dim = load_data_train(classes, dataset=dataset, dspth=root, bagsize=bag_size)
     if dataset != 'SVHN':
         ds_u = Cifar(
                 dataset=dataset,
@@ -933,7 +1189,7 @@ def get_train_loader(classes,dataset, batch_size, bag_size, root='data', method=
         num_workers=16,
         pin_memory=True
     )
-    return dl_u,dataset_length
+    return dl_u,dataset_length,input_dim
 
 
 def get_val_loader(dataset, batch_size, num_workers, pin_memory=True, root='data',n_classes=10):
@@ -1012,7 +1268,7 @@ class SVHN2(Dataset):
                 ])
             else:
                 self.trans = T.Compose([
-                    T.Resize((64, 64)),
+                    T.Resize((32, 32)),
                     T.Normalize(mean, std),
                     T.ToTensor(),
                 ])
@@ -1076,6 +1332,22 @@ class Cifar2(Dataset):
                 transforms.ToTensor(),
                 transforms.Normalize(mean, std),
             ])
+        elif dataset in [
+            'Corel16k', 'Corel5k', 'Delicious', 'Bookmarks',
+            'Eurlex_DC', 'Eurlex_SM', 'Scene', 'Yeast'
+        ]:
+            # 这些数据集本身就是已提取好的扁平特征向量，
+            # 在训练前不需要任何数据增强或归一化。
+            trans_weak = T.Compose([
+                T.ToTensor(),  # ← 只是把 ndarray → FloatTensor
+            ])
+            trans_strong0 = T.Compose([
+                T.ToTensor(),  # 强弱同样：啥也不干
+            ])
+            trans_strong1 = T.Compose([
+                T.ToTensor(),
+            ])
+
         elif dataset in ['FashionMNIST','KMNIST']:
             trans_weak = T.Compose([
                 T1.Resize((28, 28)),
@@ -1209,7 +1481,7 @@ class Cifar2(Dataset):
                     T1.Normalize(mean, std),
                     T1.ToTensor(),
                 ])
-            elif dataset in ['CIFAR10', 'CIFAR100']:
+            elif dataset in ['CIFAR10', 'CIFAR100','SVHN']:
                 self.trans = T.Compose([
                     T.Resize((32, 32)),
                     T.Normalize(mean, std),

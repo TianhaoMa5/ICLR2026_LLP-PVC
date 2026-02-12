@@ -1,6 +1,21 @@
-.idea/
 __pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# pytorch checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# logs
+runs/
+wandb/
+logs/
+
+# data
 data/
-dataset/
+datasets/
 
-
+# mac
+.DS_Store

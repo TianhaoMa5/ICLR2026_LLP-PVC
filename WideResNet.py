@@ -73,7 +73,7 @@ class WideResnetBackbone(nn.Module):
         n_layers = [16, ] + [self.k * 16 * (2 ** i) for i in range(3)]
 
         self.conv1 = nn.Conv2d(
-            1,
+            3,
             n_layers[0],
             kernel_size=3,
             stride=1,

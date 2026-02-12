@@ -11,10 +11,7 @@ import numpy as np
 def setup_default_logging(args, default_level=logging.INFO,
                           format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s"):
     
-    if 'CIFAR' in args.dataset:      
-        output_dir = os.path.join(args.dataset, f'x{args.bagsize}_seed{args.seed}', args.exp_dir)
-    else:
-        output_dir = os.path.join(args.dataset, f'x{args.bagsize}_seed{args.seed}', args.exp_dir)
+    output_dir = os.path.join(args.dataset, f'x{args.bagsize}_seed{args.seed}_lr{args.lr}_{args.pl_method}', args.exp_dir)
         
     os.makedirs(output_dir, exist_ok=True)
 
@@ -137,3 +134,17 @@ class WarmupCosineLrScheduler(_LRScheduler):
             ratio = np.cos((np.pi * real_iter) / (4 * real_max_iter * 0.5))  # 修改了这一行
 
         return ratio
+
+    def get_warmup_ratio(self):
+        # progress: 0 -> 1
+        t = (self.last_epoch + 1) / max(1, self.warmup_iter)
+
+        if self.warmup == "linear":
+            # 从 warmup_ratio 线性升到 1
+            return self.warmup_ratio + (1 - self.warmup_ratio) * t
+
+        if self.warmup == "exp":
+            # 从 warmup_ratio 指数升到 1（更常用）
+            return self.warmup_ratio ** (1 - t)
+
+        raise ValueError("warmup must be 'linear' or 'exp'")

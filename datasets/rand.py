@@ -177,12 +177,13 @@ def translate_y_func(img, offset, fill=(0, 0, 0)):
 
 
 def posterize_func(img, bits):
-    '''
-        same output as PIL.ImageOps.posterize
-    '''
-    out = np.bitwise_and(img, np.uint8(255 << (8 - bits)))
-    return out
+    bits = int(bits)
+    bits = max(1, min(8, bits))          # 保证 1..8
+    shift = 8 - bits
 
+    mask = (np.uint16(255) << shift)     # 用 uint16 计算，避免溢出
+    out = (img.astype(np.uint16) & mask).astype(np.uint8)
+    return out
 
 def shear_y_func(img, factor, fill=(0, 0, 0)):
     H, W = img.shape[0], img.shape[1]

@@ -1,4 +1,6 @@
 from __future__ import print_function
+from __future__ import annotations
+
 import random
 
 import time
@@ -17,8 +19,9 @@ from datasets.cifar import get_train_loader, get_val_loader
 from utils import accuracy, setup_default_logging, AverageMeter, CurrentValueMeter, WarmupCosineLrScheduler
 import tensorboard_logger
 import torch.multiprocessing as mp
-from LeNet import LeNet5
+from LeNet import LeNet5,MLPDropIn
 from torchvision import models
+import os, csv
 
 import torch
 import math
@@ -26,22 +29,234 @@ import math
 
 
 
+import math
+import torch
+from typing import List, Dict, Tuple, Any
+
+def _fix_counts_from_proportion(alpha: torch.Tensor, m: int) -> torch.Tensor:
+    alpha = alpha.to(torch.float64).clamp_min(0)
+    if float(alpha.sum()) <= 0:
+        K = alpha.numel()
+        base = [m // K] * K
+        for t in range(m - sum(base)):
+            base[t % K] += 1
+        return torch.tensor(base, dtype=torch.int64)
+    raw = alpha / alpha.sum() * m
+    c = torch.round(raw).to(torch.int64)
+    diff = int(m - int(c.sum()))
+    if diff != 0:
+        frac = (raw - torch.floor(raw)).tolist()
+        idx = list(range(alpha.numel()))
+        if diff > 0:
+            idx.sort(key=lambda i: -frac[i])
+            for t in range(diff):
+                c[idx[t % len(idx)]] += 1
+        else:
+            idx.sort(key=lambda i: frac[i])
+            for t in range(-diff):
+                c[idx[t % len(idx)]] -= 1
+    c.clamp_(min=0)
+    s = int(c.sum())
+    if s != m:
+        adj = m - s
+        for t in range(abs(adj)):
+            j = t % c.numel()
+            c[j] += 1 if adj > 0 else -1
+    return c
+
+
+@torch.no_grad()
+def _dp_forward_tables(
+    log_p: torch.Tensor,
+    counts_used: torch.Tensor
+) -> Tuple[list[Dict[tuple, float]], Dict[tuple, float]]:
+    m, K = log_p.shape
+    c_list = counts_used.tolist()
+    zero = tuple([0]*K)
+
+    F_tables: list[Dict[tuple, float]] = [None] * (m+1)
+    F_tables[0] = {zero: 0.0}
+
+    for t in range(1, m+1):
+        prev = F_tables[t-1]
+        cur: Dict[tuple, float] = {}
+        lt = log_p[t-1]
+        for cnt, lp in prev.items():
+            for k in range(K):
+                if cnt[k] >= c_list[k]:
+                    continue
+                new_cnt = list(cnt)
+                new_cnt[k] += 1
+                nt = tuple(new_cnt)
+                val = lp + float(lt[k])
+                old = cur.get(nt, float('-inf'))
+                if val > old:
+                    cur[nt] = val + math.log1p(math.exp(old - val)) if old != float('-inf') else val
+                else:
+                    cur[nt] = old + math.log1p(math.exp(val - old))
+        F_tables[t] = cur
+
+    return F_tables, F_tables[m]
+
+
+@torch.no_grad()
+def _dp_backward_tables(
+    log_p: torch.Tensor,
+    counts_used: torch.Tensor
+) -> Tuple[list[Dict[tuple, float]], Dict[tuple, float]]:
+    m, K = log_p.shape
+    c_list = counts_used.tolist()
+    zero = tuple([0]*K)
+    B_tables: list[Dict[tuple, float]] = [None] * (m+2)
+    B_tables[m+1] = {zero: 0.0}
+
+    for t in range(m, 0, -1):
+        nxt = B_tables[t+1]
+        cur: Dict[tuple, float] = {}
+        lt = log_p[t-1]
+        for cnt, lp in nxt.items():
+            for k in range(K):
+                if cnt[k] >= c_list[k]:
+                    continue
+                new_cnt = list(cnt)
+                new_cnt[k] += 1
+                nt = tuple(new_cnt)
+                val = lp + float(lt[k])
+                old = cur.get(nt, float('-inf'))
+                if val > old:
+                    cur[nt] = val + math.log1p(math.exp(old - val)) if old != float('-inf') else val
+                else:
+                    cur[nt] = old + math.log1p(math.exp(val - old))
+        B_tables[t] = cur
+
+    return B_tables, B_tables[1]
+
+
+@torch.no_grad()
+def enumerate_posterior_responsibilities_iter(
+    labels_p: torch.Tensor,
+    proportion: Optional[torch.Tensor]=None,
+    counts: Optional[torch.Tensor]=None,
+    eps: float = 1e-12,
+    max_states_warn: int = 5_000_000,
+    hard_error_when_large: bool = False,
+) -> Tuple[torch.Tensor, float, torch.Tensor]:
+    assert labels_p.dim() == 2
+    m, K = labels_p.shape
+    dev = labels_p.device
+    dtype = labels_p.dtype
+
+    counts_used = (counts.detach().cpu().to(torch.int64)
+                   if counts is not None else
+                   _fix_counts_from_proportion(proportion.detach().cpu(), m))
+    assert int(counts_used.sum()) == m, f"counts sum {int(counts_used.sum())} != m {m}"
+
+    log_p = (labels_p.clamp_min(eps)).log().cpu().to(torch.float64)
+
+    F_tables, F_full = _dp_forward_tables(log_p, counts_used)
+    B_tables, _ = _dp_backward_tables(log_p, counts_used)
+
+    c_tuple = tuple(counts_used.tolist())
+    neg_inf = float('-inf')
+
+    logZ = F_full.get(c_tuple, neg_inf)
+    if logZ == neg_inf:
+        r = torch.full((m, K), 1.0 / K, dtype=dtype, device=dev)
+        return r, float(neg_inf), counts_used
+
+    def get_log(d: Dict[tuple, float], key: tuple) -> float:
+        return d.get(key, neg_inf)
+
+    r_cpu = torch.zeros((m, K), dtype=torch.float64)
+    for i in range(1, m+1):
+        F_prev = F_tables[i-1]
+        B_next = B_tables[i+1]
+        for k in range(K):
+            if counts_used[k] == 0:
+                continue
+            c_minus = list(c_tuple)
+            c_minus[k] -= 1
+            if c_minus[k] < 0:
+                continue
+            c_minus = tuple(c_minus)
+
+            logZ_loo = neg_inf
+            for u_cnt, lp_u in F_prev.items():
+                v_cnt = []
+                ok = True
+                for t in range(K):
+                    vt = c_minus[t] - u_cnt[t]
+                    if vt < 0:
+                        ok = False; break
+                    v_cnt.append(vt)
+                if not ok:
+                    continue
+                v_cnt = tuple(v_cnt)
+                lp_v = get_log(B_next, v_cnt)
+                if lp_v == neg_inf:
+                    continue
+                val = lp_u + lp_v
+                if val > logZ_loo:
+                    logZ_loo = val + (0.0 if logZ_loo == neg_inf else math.log1p(math.exp(logZ_loo - val)))
+                else:
+                    logZ_loo = logZ_loo + (0.0 if val == neg_inf else math.log1p(math.exp(val - logZ_loo)))
+
+            if logZ_loo == neg_inf:
+                r_cpu[i-1, k] = 0.0
+            else:
+                r_cpu[i-1, k] = math.exp(float(log_p[i-1, k]) + (logZ_loo - logZ))
+
+    r = r_cpu.to(dtype=dtype, device=dev)
+    row_sum = r.sum(dim=1, keepdim=True).clamp_min(1e-12)
+    r = r / row_sum
+    return r, float(logZ), counts_used
+
+@torch.no_grad()
+def distributed_sinkhorn(out, args, proportion):
+    Q = out
+    K = Q.shape[0]
+    B = Q.shape[1]
+
+    for it in range(args.sinkhorn_iterations):
+        sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
+        sum_of_rows[sum_of_rows == 0] = 1
+        Q /= sum_of_rows
+
+        sum_of_cols = torch.sum(Q, dim=0, keepdim=True)
+        sum_of_cols[sum_of_cols == 0] = 1
+        Q /= sum_of_cols
+        Q *= proportion
+
+    sum_of_cols = torch.sum(Q, dim=0, keepdim=True)
+    sum_of_cols[sum_of_cols == 0] = 1
+    Q /= sum_of_cols
+    Q *= proportion
+
+    return Q
+# -------- 自训练损失（保持不变）--------
+def self_training_loss_from_enumeration(
+    logits: torch.Tensor,                   # [m,K]
+    proportion: Optional[torch.Tensor]=None,
+    counts: Optional[torch.Tensor]=None,
+    temperature: float = 1.0,
+    eps: float = 1e-12,
+    **enum_kwargs
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert logits.dim() == 2
+    log_q = torch.log_softmax(logits / temperature, dim=1)
+    labels_p = torch.softmax((logits / temperature).detach(), dim=1)
+    r, _logZ, counts_used = enumerate_posterior_responsibilities_iter(
+        labels_p=labels_p, proportion=proportion, counts=counts, **enum_kwargs
+    )
+    loss = -(r.detach().to(log_q.dtype) * log_q).sum(dim=1).mean()
+    return loss, r, counts_used
 
 def cross_entropy_loss_torch(softmax_matrix, onehot_labels):
-    """
-    计算交叉熵损失 (PyTorch版本)
 
-    :param softmax_matrix: 预测的softmax矩阵 (batch_size, num_classes)
-    :param onehot_labels: 真实的onehot标签矩阵 (batch_size, num_classes)
-    :return: 平均交叉熵损失
-    """
-    # 使用 log_softmax 确保数值稳定性
     log_softmax = torch.log(softmax_matrix + 1e-12)
 
-    # 计算交叉熵
     cross_entropy = -torch.sum(onehot_labels * log_softmax, dim=1)
 
-    # 返回平均损失
     mean_loss = torch.mean(cross_entropy)
     return mean_loss
 
@@ -55,8 +270,8 @@ def set_model(args):
             n=args.wresnet_n,
             proj=False
         )
-        #model = models.resnet18(pretrained=True)
-        #model.fc = nn.Linear(model.fc.in_features, args.n_classes)
+        model = models.resnet18(pretrained=False)
+        model.fc = nn.Linear(model.fc.in_features, args.n_classes)
 
         #model = resnet34(num_classes=10)
     else:
@@ -82,12 +297,12 @@ def set_model(args):
                 n=args.wresnet_n,
                 proj=False
             )
-           # model = models.resnet18(pretrained=True)
-            #model.fc = nn.Linear(model.fc.in_features, 10)
+            model = models.resnet18(pretrained=True)
+            model.fc = nn.Linear(model.fc.in_features, 10)
             #ema_model = resnet34(num_classes=10)
 
         else:
-            ema_model = LeNet5()
+            model = MLPDropIn()
         #ema_model = ResNet18CIFAR10(num_classes=args.n_classes)
 
         for param_q, param_k in zip(model.parameters(), ema_model.parameters()):
@@ -119,7 +334,7 @@ def ema_model_update(model, ema_model, ema_m):
 
 def llp_loss(labels_proportion, y):
     x = torch.tensor(labels_proportion, dtype=torch.float64).cuda()
-    x = x.squeeze(0)  # 或者 x.squeeze()
+    x = x.squeeze(0)  #
 
     # Ensure y is also double
 
@@ -149,234 +364,15 @@ def custom_loss(probs, lambda_val=1.0):
     return loss
 
 
-def compute_CC_loss(softmax_p, proportions, epsilon=1e-12):
-    """
-    计算损失函数：
-    R_cc(f) = -sum_{c=1}^C log( sum_{S_c subset size k_c} prod_{j in S_c} f_c(x_j) * prod_{j not in S_c} (1 - f_c(x_j)) )
-
-    参数：
-    - labels_p: Tensor of shape [s, C], f_c(x_j) 的 softmax 输出
-    - proportions: Tensor of shape [C], 每个类别的比例
-    - epsilon: float, 用于数值稳定性的小常数
-
-    返回：
-    - loss: scalar tensor, 计算得到的损失值
-    """
-    s, C = softmax_p.shape  # s: bag size, C: number of classes
-    device = softmax_p.device
-    dtype = torch.double  # 使用double精度
-
-    # 计算 k_c = proportions[c] * s，并确保 k_c 是整数
-    k_c = (proportions * s).long()  # [C]
-
-    # 初始化 E: [C, k_max + 1]
-    k_max = k_c.max().item()
-    E = torch.zeros(C, k_max + 1, device=device, dtype=dtype)
-    E[:, 0] = 1.0  # E[c, 0] = 1
-
-    # 动态规划计算 E[c, l] = sum_{S subset size l} prod_{j in S} f_c(x_j) * prod_{j not in S} (1 - f_c(x_j))
-    for j in range(s):
-        a = softmax_p[j].to(dtype)  # 确保softmax_p[j]为double精度
-        # 计算新的 E，而不是原地修改
-        E_new = E.clone()
-        # 仅更新 1 到 k_max 的部分
-        E_new[:, 1:k_max+1] = E[:, 1:k_max+1] * (1 - a.unsqueeze(1)) + E[:, 0:k_max] * a.unsqueeze(1)
-        E = E_new
-
-    # 提取每个类别 c 的 E[c, k_c[c]]
-    class_indices = torch.arange(C, device=device)
-    E_kc = E[class_indices, k_c]  # [C]
-
-    # 计算 log(E_kc + epsilon) 以避免 log(0)
-    log_E_kc = torch.log(E_kc + epsilon)  # [C]
-
-    # 计算最终的损失
-    loss = -torch.sum(log_E_kc)  # scalar
-
-    return loss
-def compute_CC_loss_logDP(labels_p, proportions, epsilon=1e-12):
-    """
-    利用 log 空间的动态规划来计算:
-        R_cc(f) = -sum_{c=1}^C log( sum_{S_c subset size k_c} prod_{j in S_c} f_c(x_j) * prod_{j not in S_c} (1 - f_c(x_j)) )
-
-    参数：
-    - labels_p: Tensor of shape [s, C], f_c(x_j) 的输出 (概率)
-    - proportions: Tensor of shape [C], 每个类别的比例
-    - epsilon: float, 用于数值稳定性的小常数
-
-    返回：
-    - loss: scalar tensor, 计算得到的损失值
-    """
-    s, C = labels_p.shape  # s: bag size, C: number of classes
-    device = labels_p.device
-    dtype = labels_p.dtype
-
-    # 计算 k_c = proportions[c] * s，并确保 k_c 是整数
-    k_c = (proportions * s).long()  # [C]
-
-    # 动态规划需要的最大子集大小
-    k_max = k_c.max().item()
-
-    # 初始化 logE: [C, k_max + 1]
-    # 用一个极小的值(如 -1e30)来模拟负无穷, 以便后续做 log-sum-exp
-    logE = torch.full((C, k_max + 1), -1e30, device=device, dtype=dtype)
-    logE[:, 0] = 0.0  # log(1) = 0
-
-    # 动态规划计算 logE[c, l]
-    # 原公式: E_new[c, l] = E[c, l] * (1 - a_c) + E[c, l-1] * a_c
-    # 转成 log 空间:
-    #   logE_new[c, l] = log_sum_exp( logE[c, l] + log(1 - a_c), logE[c, l-1] + log(a_c) )
-    for j in range(s):
-        p_j = labels_p[j]  # [C]
-        log_p_j   = torch.log(p_j.clamp_min(epsilon))          # log( f_c(x_j) )
-        log_1mp_j = torch.log((1 - p_j).clamp_min(epsilon))    # log(1 - f_c(x_j))
-
-        # 准备更新 logE
-        logE_new = torch.full((C, k_max + 1), -1e30, device=device, dtype=dtype)
-
-        # l = 0 时，只能从原来的 l=0 转移过来，且乘以 (1-p_j)
-        # logE_new[:, 0] = logE[:, 0] + log(1 - p_j)
-        logE_new[:, 0] = logE[:, 0] + log_1mp_j
-
-        # l = 1..k_max 时, 需要做 log-sum-exp
-        for l in range(1, k_max + 1):
-            # 两部分来源：
-            #   1) 维持原子集大小 l: 从 logE[:, l] + log(1 - p_j)
-            #   2) 增加一个元素:   从 logE[:, l-1] + log(p_j)
-            v1 = logE[:, l]   + log_1mp_j
-            v2 = logE[:, l-1] + log_p_j
-            # 做 log-sum-exp
-            max_v12 = torch.maximum(v1, v2)
-            # 避免 exp() 的值过大或者过小，做相对位置的 log-sum-exp
-            log_sum = max_v12 + torch.log(torch.exp(v1 - max_v12) + torch.exp(v2 - max_v12) + epsilon)
-            logE_new[:, l] = log_sum
-
-        # 更新
-        logE = logE_new
-
-    # 提取对应 k_c 的 logE 值，即 log E[c, k_c]
-    class_indices = torch.arange(C, device=device)
-    logE_kc = logE[class_indices, k_c]  # [C]
-
-    # 计算损失: -sum_c logE[c, k_c]
-    loss = -torch.sum(logE_kc)  # scalar
-
-    return loss
-
-def compute_CC_loss_simplified_gpu(labels_p, proportions, epsilon=1e-12):
-    """
-    计算简化版的 Class-Conditional 损失函数的 GPU 并行版本:
-    R_cc(f) = -sum_{c=1}^C log( sum_{S_c subset size k_c} prod_{j in S_c} f_c(x_j) )
-
-    参数：
-    - labels_p: Tensor of shape [s, C], f_c(x_j) 的 softmax 输出
-    - proportions: Tensor of shape [C], 每个类别的比例
-    - epsilon: float, 用于数值稳定性的小常数
-
-    返回：
-    - loss: scalar tensor, 计算得到的损失值
-    """
-    s, C = labels_p.shape  # s: bag size, C: number of classes
-    device = labels_p.device  # 获取设备信息 (GPU 或 CPU)
-    dtype = labels_p.dtype
-
-    # 计算每个类别需要选择的样本数 k_c
-    k_c = (proportions * s).long()  # [C]
-
-    # 计算每个类别的概率乘积部分
-    f_c = labels_p  # [s, C]，表示每个样本属于各类别的概率
-    # f_c 是每个类别的 softmax 输出，我们可以直接对其进行加和和对数运算
-
-    # 计算每个类别的概率乘积部分：sum_{S_c subset size k_c} prod_{j in S_c} f_c(x_j)
-    # 这里我们不再使用循环，而是用矩阵操作来实现
-
-    # 计算每个类别的概率总和：对每个类别的 softmax 输出取和
-    # f_c 是大小 [s, C]，每一列是某个类别的概率
-    product_sum = f_c.sum(dim=0)  # [C], 计算每个类别的所有样本概率之和
-
-    # 计算对数并加上 epsilon 以避免对数 0
-    log_product_sum = torch.log(product_sum + epsilon)  # [C]
-
-    # 计算最终损失：对每个类别的对数概率取负并求和
-    loss = -log_product_sum.sum()  # scalar, 将所有类别的损失求和
-
-    return loss
 
 
-def multi_instance_loss_dp_gpu(labels_p: torch.Tensor,
-                               proportions: torch.Tensor) -> torch.Tensor:
-    """
-    使用动态规划在 GPU 上并行（矢量化）计算多实例损失:
-
-        Loss = sum_{c=1 to C} log( sum_{|S_c|=k_c} product_{j in S_c} labels_p[j,c] )
-
-    参数:
-    --------
-    labels_p : shape (s, C), float32
-        - 每行是一个样本对 C 个类别的 softmax 输出
-    proportions : shape (C,), float32
-        - 每个类别所占的比例, 用来计算 k_c
-
-    返回:
-    --------
-    total_loss : 一个标量 (float32)
-    """
-    device = labels_p.device
-    s, C = labels_p.shape
-
-    # 计算每个类别对应的 k_c（可用 round / floor / ceil，视你的场景调整）
-    k_list = torch.round(proportions * s).long()  # shape (C,)
-
-    total_loss = torch.zeros([], device=device, dtype=torch.float32)  # 标量
-
-    # 针对每个类别分别用 DP 计算其 sum_{|S|=k_c} product_{j in S} (labels_p[j,c])
-    for c in range(C):
-        k_c = k_list[c].item()
-        if k_c <= 0:
-            # 若 k_c = 0，通常表示不需要选任何样本，可视需求将其处理为1或跳过
-            # 这里直接跳过该项不累加
-            continue
-
-        # 取第 c 个类别在所有样本处的概率值, shape = (s,)
-        p = labels_p[:, c]
-
-        # ------ 动态规划 DP 表: dp[t, r] ------
-        # dp[t, r] = 从前 t 个样本中选 r 个的所有乘积之和
-        # 大小: (s+1) x (k_c+1)
-        # 注意: 这里用 float32，如果担心数值精度，可改为 float64
-        dp = torch.zeros((s + 1, k_c + 1), device=device, dtype=torch.float32)
-        dp[0, 0] = 1.0  # 从前0个样本中选0个, 乘积之和=1
-
-        # 逐个样本做更新 (无法完全消除这个 for，但对 r 的更新用并行向量化)
-        for t in range(s):
-            # dp[t+1, 0] = dp[t, 0]
-            dp[t + 1, 0] = dp[t, 0]
-            # 对 r in [1..k_c]:
-            # dp[t+1, r] = dp[t, r] + p[t]*dp[t, r-1]
-            # 我们用切片矢量化实现:
-            # dp[t+1, 1:] = dp[t, 1:] + p[t] * dp[t, :-1]
-            dp[t + 1, 1:] = dp[t, 1:] + p[t] * dp[t, :-1]
-
-        # dp[s, k_c] 即为 sum_{|S|=k_c} product_{j in S} p[j]
-        sum_of_products = dp[s, k_c]  # 标量
-
-        # 数值稳定考虑：最好在对数空间中做DP。此处简单演示，最后再取 log 即可。
-        c_loss = torch.log(sum_of_products)
-
-        total_loss += c_loss
-
-    # 若做损失优化，一般会用 -total_loss 作为目标；这里直接返回总和
-    return total_loss
-
-
-# ============================ 测试示例 ============================
 def thre_ema(thre, sum_values, ema):
     return thre * ema + (1 - ema) * sum_values
 
 
 def weight_decay_with_mask(mask, initial_weight, max_mask_count):
-    mask_count = mask.sum().item()  # 计算当前 mask 中的元素数量
-    weight_decay = max(0, 1 - mask_count / max_mask_count)  # 线性衰减
+    mask_count = mask.sum().item()
+    weight_decay = max(0, 1 - mask_count / max_mask_count)
     return initial_weight * weight_decay
 
 
@@ -463,8 +459,8 @@ def train_one_epoch(epoch,
 
         # --------------------------------------
         btu = ims_u_weak.size(0)
-        #ims_u_weak = ims_u_weak.permute(0, 2, 1, 3)
-
+        if args.dataset in ["MNIST", "FashionMNIST", "KMNIST"]:
+            ims_u_weak = ims_u_weak.permute(0, 2, 1, 3)
         bt = 0
         imgs = torch.cat([ims_u_weak], dim=0).cuda()
         logits = model(imgs)
@@ -478,39 +474,37 @@ def train_one_epoch(epoch,
 
         chunk_size = len(logits_u_w) // length
         batch_size = length
-        # 分成 length 节
         chunks = [logits_u_w[i * chunk_size:(i + 1) * chunk_size] for i in range(length)]
 
-        # 打印分成的各节数据
         proportion = torch.empty((0, n_classes), dtype=torch.float64).cuda()
         batch_size = length
-
-        # 循环生成 proportion 的每一行
         for i in range(length):
-            pr = label_proportions[i][0]  # 获取每一行对应的列表
-            pr = torch.stack(pr).cuda()  # 将列表转换为张量，并移动到 GPU 上
-            proportion = torch.cat((proportion, pr.unsqueeze(0)))  # 按行拼接
+            pr = label_proportions[i][0]
+            pr = torch.stack(pr).cuda()
+            proportion = torch.cat((proportion, pr.unsqueeze(0)))
         proportion = proportion.view(length, n_classes, 1)
         proportion = proportion.squeeze(-1)
         proportion = proportion.double()
-        # 创建一个空的 PyTorch 向量用于保存 loss_p
         loss_prop = torch.Tensor([]).cuda()
         loss_prop = loss_prop.double()
         kl_divergence = torch.Tensor([]).cuda()
         kl_divergence = kl_divergence.double()
         kl_divergence_hard = torch.Tensor([]).cuda()
         kl_divergence_hard = kl_divergence_hard.double()
-        # 假设您有一个名为 chunks 的列表，其中包含多个 chunk
-        # 在循环中计算 loss_p 并添加到 all_loss_p 中
         for i, chunk in enumerate(chunks):
             labels_p = torch.softmax(chunk, dim=1)
             scores, lbs_u_guess = torch.max(labels_p, dim=1)
+
             #opt_onehot = solve_optimal_onehot_with_proportions_torch(labels_p, proportion[i], bagsize, n_classes).float()
             #opt_onehot=opt_onehot.cuda()
             labels_p = torch.mean(labels_p, dim=0)
 
             loss_p = llp_loss(proportion[i], labels_p)
-
+            loss_p, r, counts_used = self_training_loss_from_enumeration(
+                chunk, proportion=proportion[i], temperature=1.0,
+                max_states_warn=2_000_000,  # 小 bag 可放大阈值
+                hard_error_when_large=False  # 大 bag 时你可以设成 True 直接抛错
+            )
             #loss_p = compute_CC_loss_logDP(labels_p,proportion[i])
             #loss_p= compute_CC_loss_simplified_gpu(labels_p,proportion[i])
 
@@ -527,14 +521,11 @@ def train_one_epoch(epoch,
             one_hot_matrix += 1e-9
             log_one_hot_matrix = torch.log(one_hot_matrix)
 
-            # 计算软标签的KL散度
             kl_soft = F.kl_div(log_labels_p, label_prop, reduction='batchmean')
 
-            # 计算硬标签的KL散度
             kl_hard = F.kl_div(log_one_hot_matrix, label_prop, reduction='batchmean')
             kl_divergence = torch.cat((kl_divergence, kl_soft.view(1)))
             kl_divergence_hard = torch.cat((kl_divergence_hard, kl_hard.view(1)))
-            # all_loss_p 包含了每个 loss_p
         kl_divergence = kl_divergence.mean()
         kl_divergence_hard = kl_divergence_hard.mean()
         loss_prop = loss_prop.mean()
@@ -547,72 +538,31 @@ def train_one_epoch(epoch,
         x=loss_prop * bagsize
         loss = loss_prop
         with torch.no_grad():
-
-            probs = torch.softmax(logits_u_w, dim=1)
-
-            """
-            max_probs, max_idx = torch.max(probs, dim=-1)
-            # mask = max_probs.ge(p_cutoff * (class_acc[max_idx] + 1.) / 2).float()  # linear
-            # mask = max_probs.ge(p_cutoff * (1 / (2. - class_acc[max_idx]))).float()  # low_limit
-            mask = max_probs.ge(0.2+0.75 * (classwise_acc[max_idx] / (2. - classwise_acc[max_idx]))).float()  # convex
-            thre=0.2+0.75 * (classwise_acc[max_idx] / (2. - classwise_acc[max_idx]))
-
-            thre_col = thre.view(-1, 1)  # 将 thre 变为列向量
-            thre_row = thre.view(1, -1)  # 将 thre 变为行向量
-
-            thre = torch.mm(thre_col, thre_row)
-            delta = thre + (1 - thre) / (n_classes-1) * (1 - thre)
-            thre=delta
-
-            # mask = max_probs.ge(p_cutoff * (torch.log(class_acc[max_idx] + 1.) + 0.5)/(math.log(2) + 0.5)).float()  # concave
-            select = max_probs.ge(args.thr).long()
-            pseudo_lb=max_idx.long()
-            pseudo_lb=pseudo_lb.cuda()
-            if lbs_idx[select == 1].nelement() != 0:
-                selected_label[lbs_idx[select == 1]] = pseudo_lb[select == 1]
+            logits_u_w_1 = logits_u_w.detach()
 
 
-            """
-            # DA
-            """
-            prob_list.append(probs.mean(0))
-            if len(prob_list)>32:
-                prob_list.pop(0)
-            prob_avg = torch.stack(prob_list,dim=0).mean(0)
-            probs = probs / prob_avg
-            probs = probs / probs.sum(dim=1, keepdim=True)
-            """
+            probs = torch.softmax(logits_u_w_1, dim=1)
+            fl = 0
+            new_probs = []
+            for i in range(0, probs.size(0), args.bagsize):
+                prob_chunk = probs[i:i + args.bagsize]
 
-            """
-            probs是分类器对弱增强输出对 softmax结果
-            """
+                lap = torch.tensor(label_proportions[fl], dtype=torch.float64).cuda()
+                lap = lap * args.bagsize
 
-            """
-            probs_orig = probs.clone()
+                adjusted_chunk = distributed_sinkhorn(prob_chunk, args, lap)
+                new_probs.append(adjusted_chunk)
 
-            if epoch>0 or it>args.queue_batch: # memory-smoothing
-                A = torch.exp(torch.mm(feats_u_w, queue_feats.t())/args.temperature)
-                A = A/A.sum(1,keepdim=True)
-                probs = args.alpha*probs + (1-args.alpha)*torch.mm(A, queue_probs)
-            """
+                fl += 1
 
-            scores, lbs_u_guess = torch.max(probs, dim=1)
+            new_probs = torch.cat(new_probs, dim=0)
+            scores, lbs_u_guess = torch.max(new_probs, dim=1)
             mask = scores.ge(args.thr).float()
-            if positions.numel() != 0:
-                for i in range(0, bagsize):
-                    samp_lb_meter[i].update(lbs_u_guess[head + i].item())
-                    samp_p_meter[i].update(scores[head + i].item())
-            """
-            feats_w=feats_u_w
-            probs_w=probs_orig
 
-            # update memory bank
-            n = bt+btu
-            queue_feats[queue_ptr:queue_ptr + n,:] = feats_w
-            queue_probs[queue_ptr:queue_ptr + n,:] = probs_w
-            queue_ptr = (queue_ptr+n)%args.queue_size
-            """
 
+
+        loss_u = (criteria_u(logits_u_w, lbs_u_guess)).mean()
+        loss = args.lam_p * loss_prop# + args.lam_u * loss_u
         optim.zero_grad()
         loss.backward()
         optim.step()
@@ -641,29 +591,46 @@ def train_one_epoch(epoch,
 
             epoch_start = time.time()
 
+            bagsize = getattr(args, "bagsize", getattr(args, "bag_size", None))
+            if bagsize is None:
+                raise ValueError("请在 args 中提供 bagsize 或 bag_size")
+
+            exp_dir_name = os.path.basename(os.path.normpath(args.exp_dir))
+
+            os.makedirs(args.exp_dir, exist_ok=True)
+            csv_name = f"{args.dataset}_{exp_dir_name}_{bagsize}.csv"
+            csv_path = os.path.join(args.exp_dir, csv_name)
+
+            is_new = not os.path.exists(csv_path)
+            with open(csv_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                if is_new:
+                    writer.writerow(["epoch", "time_sec"])
+                writer.writerow([epoch, round(t, 2)])
+
+            # 可选：打印绝对路径，方便你确认位置
+            logger.info(f"CSV path -> {os.path.abspath(csv_path)}")
     return loss_prop_meter.avg, n_correct_u_lbs_meter.avg, n_strong_aug_meter.avg, mask_meter.avg, kl_meter.avg, kl_hard_meter.avg
 
 
-def evaluate(model, ema_model, dataloader):
+def evaluate(model, ema_model, dataloader,dataset):
     model.eval()
 
     top1_meter = AverageMeter()
     ema_top1_meter = AverageMeter()
     top5_meter = AverageMeter()
     ema_top5_meter = AverageMeter()
-    loss_meter = AverageMeter()  # 假设你有一个 AverageMeter 类来计算均值
-
+    loss_meter = AverageMeter()
     with torch.no_grad():
         for ims, lbs in dataloader:
             ims = ims.cuda()
-            #ims = ims.permute(0, 2, 1, 3)
-
+            if dataset in ["MNIST", "FashionMNIST", "KMNIST"]:
+                ims = ims.permute(0, 2, 1, 3)
             lbs = lbs.cuda()
 
             logits = model(ims)
             loss = torch.nn.CrossEntropyLoss()(logits, lbs)
 
-            # 更新交叉熵损失的累加器
             loss_meter.update(loss.item())
             scores = torch.softmax(logits, dim=1)
             top1, top5 = accuracy(scores, lbs, (1, 5))
@@ -686,7 +653,7 @@ def main():
                         help='width factor of wide resnet')
     parser.add_argument('--wresnet-n', default=28, type=int,
                         help='depth of wide resnet')
-    parser.add_argument('--dataset', type=str, default="SVHN",
+    parser.add_argument('--dataset', type=str, default="KMNIST",
                         help='number of classes in dataset')
     parser.add_argument('--n-classes', type=int, default=10,
                         help='number of classes in dataset')
@@ -694,9 +661,9 @@ def main():
                         help='number of labeled samples for training')
     parser.add_argument('--n-epoches', type=int, default=1024,
                         help='number of training epoches')
-    parser.add_argument('--batchsize', type=int, default=32,
+    parser.add_argument('--batchsize', type=int, default=128,
                         help='train batch size of bag samples')
-    parser.add_argument('--bagsize', type=int, default=16,
+    parser.add_argument('--bagsize', type=int, default=8,
                         help='train bag size of samples')
     parser.add_argument('--n-imgs-per-epoch', type=int, default=1024,
                         help='number of training images for each epoch')
@@ -706,9 +673,9 @@ def main():
 
     parser.add_argument('--lam-u', type=float, default=1.,
                         help='c oefficient of unlabeled loss')
-    parser.add_argument('--lr', type=float, default=0.03,
+    parser.add_argument('--lr', type=float, default=0.005,
                         help='learning rate for training')
-    parser.add_argument('--weight-decay', type=float, default=5e-4,
+    parser.add_argument('--weight-decay', type=float, default=5e-5,
                         help='weight decay')
     parser.add_argument('--momentum', type=float, default=0.9,
                         help='momentum for optimizer')
@@ -728,7 +695,9 @@ def main():
     parser.add_argument('--alpha', type=float, default=0.9)
     parser.add_argument('--queue_batch', type=float, default=5,
                         help='number of batches stored in memory bank')
-    parser.add_argument('--exp-dir', default='DLLP', type=str, help='experiment id')
+    parser.add_argument('--sinkhorn-iterations', type=float, default=1)
+
+    parser.add_argument('--exp-dir', default='UUM', type=str, help='experiment id')
     parser.add_argument('--checkpoint', default='', type=str, help='use pretrained model')
     parser.add_argument('--folds', default='2', type=str, help='number of dataset')
     args = parser.parse_args()
@@ -752,7 +721,7 @@ def main():
     logger.info("Total params: {:.2f}M".format(
         sum(p.numel() for p in model.parameters()) / 1e6))
 
-    dltrain_u, dataset_length = get_train_loader(args.n_classes,
+    dltrain_u, dataset_length,_ = get_train_loader(args.n_classes,
                                                  args.dataset, args.batchsize, args.bagsize, root=args.root,
                                                  method='DLLP',
                                                  supervised=False)
@@ -806,7 +775,7 @@ def main():
             train_one_epoch(epoch, bagsize=args.bagsize, n_classes=args.n_classes, **train_args, samp_ran=samp_ran,
                             )
 
-        top1, ema_top1, top5, ema_top5, loss_test = evaluate(model, ema_model, dlval)
+        top1, ema_top1, top5, ema_top5, loss_test = evaluate(model, ema_model, dlval,args.dataset)
         tb_logger.log_value('loss_prob', loss_prob, epoch)
         if (n_strong_aug == 0):
             tb_logger.log_value('guess_label_acc', 0, epoch)

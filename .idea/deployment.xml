@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="PublishConfigData" autoUpload="Always" serverName="tianhaoma5@kg3.mslab:22 agent" remoteFilesAllowedToDisappearOnAutoupload="false">
+    <serverData>
+      <paths name="root@connect.nmb1.seetacloud.com:36271 password">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/root/autodl-tmp" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="root@connect.westd.seetacloud.com:27774 password">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/root/autodl-tmp/Untitled Folder" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="tianhaoma5@kd6.mslab:22 agent">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/tianhaoma5/LLP_CC" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="tianhaoma5@ke2.mslab:22 agent">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/tianhaoma5/LLP_CC" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="tianhaoma5@ke2.mslab:22 agent (1)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/tianhaoma5/LLP_CC" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="tianhaoma5@kf1.mslab:22 agent">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/tianhaoma5/LLP_CC" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="tianhaoma5@kf1.mslab:22 agent (10)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/tianhaoma5/LLP_CC" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="tianhaoma5@kf1.mslab:22 agent (11)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/tianhaoma5/LLP_CC" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="tianhaoma5@kf1.mslab:22 agent (12)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/tianhaoma5/LLP_CC" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="tianhaoma5@kf1.mslab:22 agent (13)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/tianhaoma5/LLP_CC" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="tianhaoma5@kf1.mslab:22 agent (14)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/tianhaoma5/LLP_CC" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="tianhaoma5@kf1.mslab:22 agent (15)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/tianhaoma5/LLP_CC" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="tianhaoma5@kf1.mslab:22 agent (5)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/tianhaoma5/LLP_CC" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="tianhaoma5@kf1.mslab:22 agent (6)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/tianhaoma5/LLP_CC" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="tianhaoma5@kf1.mslab:22 agent (7)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/tianhaoma5/LLP_CC" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="tianhaoma5@kf1.mslab:22 agent (8)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/tianhaoma5/LLP_CC" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="tianhaoma5@kf1.mslab:22 agent (9)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/tianhaoma5/LLP_CC" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="tianhaoma5@kg3.mslab:22 agent">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/tianhaoma5/LLP_CC" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+    </serverData>
+    <option name="myAutoUpload" value="ALWAYS" />
+  </component>
+</project>

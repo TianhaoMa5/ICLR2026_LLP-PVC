@@ -27,7 +27,52 @@ class LeNet5(nn.Module):
         x = self.fc3(x)
         return x
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
+class LeNet5Plus(nn.Module):
+    def __init__(self, num_classes=10, c1=32, c2=64, fc1=256, fc2=128, drop=0.5):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, c1, 5, stride=1, padding=2)
+        self.bn1   = nn.BatchNorm2d(c1)
+        self.pool1 = nn.MaxPool2d(2, 2)
+
+        self.conv2 = nn.Conv2d(c1, c2, 5, stride=1)   # 28->14->10
+        self.bn2   = nn.BatchNorm2d(c2)
+        self.pool2 = nn.MaxPool2d(2, 2)               # 10->5
+
+        self.fc1 = nn.Linear(c2 * 5 * 5, fc1)
+        self.fc2 = nn.Linear(fc1, fc2)
+        self.fc3 = nn.Linear(fc2, num_classes)
+
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.pool1(F.relu(self.bn1(self.conv1(x))))
+        x = self.pool2(F.relu(self.bn2(self.conv2(x))))
+        x = x.flatten(1)
+        x = self.drop(F.relu(self.fc1(x)))
+        x = self.drop(F.relu(self.fc2(x)))
+        return self.fc3(x)
+
+class MLPDropIn(nn.Module):
+    def __init__(self, num_classes=10, use_dropout=False, p=0.2):
+        super().__init__()
+        self.flatten = nn.Flatten()
+        self.drop = nn.Dropout(p) if use_dropout else nn.Identity()
+        self.fc1 = nn.Linear(28*28, num_classes)  # 784 -> num_classes
+        self.fc2 = nn.Identity()
+        self.fc3 = nn.Identity()
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.flatten(x)
+        x = self.drop(x)
+        x = self.fc1(x)   # logits
+        x = self.fc2(x)   # 占位，不做事
+        x = self.fc3(x)   # 占位，不做事
+        return x
 class LeNet(nn.Module):
     """
     LeNet: A simple convolutional neural network for image classification.
