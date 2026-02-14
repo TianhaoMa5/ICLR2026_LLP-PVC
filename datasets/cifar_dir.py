@@ -417,7 +417,7 @@ class ThreeCropsTransform:
 
 
 
-def load_data_train(num_classes, dataset='CIFAR10', dspth='./data', bagsize=16):
+def load_data_train(args,num_classes, dataset='CIFAR10', dspth='./data', bagsize=16):
     input_dim=1
     if dataset == 'Corel16k':
         # Corel16k 有 10 个子集（001–010）
@@ -641,7 +641,7 @@ def load_data_train(num_classes, dataset='CIFAR10', dspth='./data', bagsize=16):
     data_u, label_prob, labels_real, labels_idx, dataset_length, indices_u, input_dim = \
         make_bags_dirichlet_by_class_noreplace(
             data, labels, bagsize, num_classes, dataset, input_dim,
-            alpha0=10.0,  # 你要“狄利克雷参数=1”就用 1.0
+            alpha0=args.pi,  # 你要“狄利克雷参数=1”就用 1.0
             seed=0
         )
     return data_u, label_prob, labels_real, labels_idx, dataset_length, indices_u, input_dim
@@ -1299,8 +1299,8 @@ class SVHN(Dataset):
         return leng
 
 
-def get_train_loader(classes,dataset, batch_size, bag_size, root='data', method='co',supervised=False):
-    data_u, label_prob, labels,label_idx,dataset_length,indices_u,input_dim = load_data_train(classes, dataset=dataset, dspth=root, bagsize=bag_size)
+def get_train_loader(args,classes,dataset, batch_size, bag_size, root='data', method='co',supervised=False):
+    data_u, label_prob, labels,label_idx,dataset_length,indices_u,input_dim = load_data_train(args,classes, dataset=dataset, dspth=root, bagsize=bag_size)
     if dataset != 'SVHN':
         ds_u = Cifar(
                 dataset=dataset,

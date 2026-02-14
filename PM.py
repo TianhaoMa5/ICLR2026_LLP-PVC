@@ -794,6 +794,12 @@ def main ():
     parser .add_argument ('--alpha',type =float ,default =0.9 )
     parser .add_argument ('--queue_batch',type =float ,default =5 ,
     help ='number of batches stored in memory bank')
+    parser.add_argument(
+        '--pi', default='10', type=str,
+        help='Bag purity / concentration control for alphafirst and clusterbag. '
+             'Smaller pi => more homogeneous bags (instances tend to come from the same label-proportion target or the same cluster); '
+             'larger pi => more mixed bags.'
+    )
 
     parser.add_argument(
         '--pl_method',
@@ -829,7 +835,7 @@ def main ():
         from datasets.cifar_cluster2 import get_train_loader
     else:
         raise ValueError(f"Unknown pl_method: {args.pl_method}")
-    dltrain_u ,dataset_length ,input_dim =get_train_loader (args .n_classes ,
+    dltrain_u ,dataset_length ,input_dim =get_train_loader (args,args .n_classes ,
     args .dataset ,args .batchsize ,args .bagsize ,root =args .root ,
     method ='DLLP',
     supervised =False )

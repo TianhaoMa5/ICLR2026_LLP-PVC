@@ -48,23 +48,11 @@ def set_model (args ):
 
 
 
-        model = WideResnet(
-            n_classes=args.n_classes,
-            k=args.wresnet_k,
-            n=args.wresnet_n,
-            proj=False
-        )
         model = models.resnet18(pretrained=True)
         model.fc = nn.Linear(model.fc.in_features, args.n_classes)
         init_fc_bias_sigmoid_to_1_over_k(model, args.n_classes)
 
     else :
-        model = WideResnet(
-            n_classes=args.n_classes,
-            k=args.wresnet_k,
-            n=args.wresnet_n,
-            proj=False
-        )
         model =LeNet5 (num_classes=args.n_classes)
         init_fc_bias_sigmoid_to_1_over_k(model, args.n_classes)
 
@@ -851,10 +839,7 @@ def evaluate(model, ema_model, dataloader, dataset):
 def main ():
     parser =argparse .ArgumentParser (description ='DLLP Cifar Training')
     parser .add_argument ('--root',default ='./data',type =str ,help ='dataset directory')
-    parser .add_argument ('--wresnet-k',default =4 ,type =int ,
-    help ='width factor of wide resnet')
-    parser .add_argument ('--wresnet-n',default =16 ,type =int ,
-    help ='depth of wide resnet')
+
     parser .add_argument ('--dataset',type =str ,default ="KMNIST",
     help ='number of classes in dataset')
     parser .add_argument ('--n-classes',type =int ,default =10 ,
@@ -872,7 +857,10 @@ def main ():
 
     parser .add_argument ('--eval-ema',default =False ,help ='whether to use ema model for evaluation')
     parser .add_argument ('--ema-m',type =float ,default =0.999 )
-
+    parser.add_argument('--warmup-frac', type=float, default=0.08,
+                        help='warmup fraction of total iterations (e.g., 0.08)')
+    parser.add_argument('--warmup-lr', type=float, default=5e-5,
+                        help='warmup starting learning rate (e.g., 5e-5)')
     parser .add_argument ('--lam-u',type =float ,default =1. ,
     help ='c oefficient of unlabeled loss')
     parser .add_argument ('--lr',type =float ,default= 2.5e-3 ,
@@ -906,6 +894,13 @@ def main ():
     parser .add_argument ('--exp-dir',default ='CC',type =str ,help ='experiment id')
     parser .add_argument ('--checkpoint',default ='',type =str ,help ='use pretrained model')
     parser .add_argument ('--folds',default ='2',type =str ,help ='number of dataset')
+    parser.add_argument(
+        '--pi', default='10', type=str,
+        help='Bag purity / concentration control for alphafirst and clusterbag. '
+             'Smaller pi => more homogeneous bags (instances tend to come from the same label-proportion target or the same cluster); '
+             'larger pi => more mixed bags.'
+    )
+
     args =parser .parse_args ()
 
     logger ,output_dir =setup_default_logging (args )
@@ -957,9 +952,8 @@ def main ():
         nesterov=True
     )
 
-    # 4% iter warmup: 2e-4 -> 1e-3 (args.lr)
-    warmup_iter = int(0.08 * n_iters_all)
-    warmup_ratio = (5e-5 / args.lr)
+    warmup_iter = int(args.warmup_frac * n_iters_all)
+    warmup_ratio = (args.warmup_lr / args.lr)
 
     lr_schdlr = WarmupCosineLrScheduler(
         optim,

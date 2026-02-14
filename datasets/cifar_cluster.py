@@ -1,16 +1,13 @@
+import os
+import numpy as np
 import os.path as osp
 import pickle
-import numpy as np
 import scipy.io as sio
 
-import pandas as pd
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
-from collections import Counter, OrderedDict
-import h5py
-from MLclf import MLclf
-from collections import defaultdict
+from sklearn.decomposition import PCA
 
 from datasets import tran as T
 from datasets.rand import RandomAugment
@@ -25,7 +22,411 @@ from PIL import Image
 
 label_map = {}
 class_mapping={}
+import numpy as np
+from collections import Counter, OrderedDict
+from itertools import groupby
+from sklearn.decomposition import PCA
+from sklearn.cluster import MiniBatchKMeans
 
+# 控制这次聚类想对齐的 “uniform bag size”
+# 例如 16 / 32 / 64 / 128 / 256；为 None 时退回平均大小方案
+TARGET_UNIFORM_BAGSIZE = None
+from torch.utils.data import DataLoader
+
+
+from torch.utils.data._utils.collate import default_collate
+
+
+def collate_u(batch):
+    # 和你现在的一样，我原样放在这
+    fields = list(zip(*batch))
+    collated = []
+
+    for field in fields:
+        first = field[0]
+
+        if torch.is_tensor(first):
+            shapes = [x.shape for x in field]
+            if all(s == shapes[0] for s in shapes):
+                collated.append(torch.stack(field, dim=0))
+            else:
+                collated.append(list(field))
+
+        elif isinstance(first, np.ndarray):
+            shapes = [x.shape for x in field]
+            if all(s == shapes[0] for s in shapes):
+                tensors = [torch.as_tensor(x) for x in field]
+                collated.append(torch.stack(tensors, dim=0))
+            else:
+                tensors = [torch.as_tensor(x) for x in field]
+                collated.append(tensors)
+
+        else:
+            try:
+                collated.append(default_collate(list(field)))
+            except Exception:
+                collated.append(list(field))
+
+    return tuple(collated)
+
+
+
+def get_feature_bags_and_cache(
+    data,
+    labels,
+    dataset,        # 'KMNIST' / 'FashionMNIST' / 'CIFAR10'
+    num_classes,
+    min_size=16,
+    max_size=256,
+    random_state=0,
+):
+    """
+    如果 ./data 下已经有对应划分方案的文件，就直接加载；
+    否则调用 make_feature_bags_variable_size 生成，再保存到 ./data。
+    返回值和你原来的一样。
+    """
+
+    # 1. 生成一个“划分方案”的名字，写到文件名里
+    #    你可以按需要改，比如加上 bagsize、fold 等信息
+    scheme = f"kmeans_ms{min_size}_mx{max_size}_rs{random_state}"
+    save_dir = "./data"
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f"{dataset}_{scheme}.pt")
+
+    # 2. 如果文件已经存在，直接加载
+    if os.path.exists(save_path):
+        print(f"[INFO] load feature bags from {save_path}")
+        obj = torch.load(save_path, map_location="cpu")
+
+        data_u      = obj["data_u"]
+        label_prob  = obj["label_prob"]
+        labels_real = obj["labels_real"]
+        labels_idx  = obj["labels_idx"]
+        dataset_len = obj["dataset_length"]
+        indices_u   = obj["indices_u"]
+        input_dim   = obj["input_dim"]
+
+        return data_u, label_prob, labels_real, labels_idx, dataset_len, indices_u, input_dim
+
+    # 3. 否则调用你原来的函数生成
+    print(f"[INFO] create feature bags for {dataset}, will save to {save_path}")
+    data_u, label_prob, labels_real, labels_idx, dataset_length, indices_u, input_dim = \
+        make_feature_bags_variable_size(
+            data=data,
+            labels=labels,
+            dataset=dataset,      # 例如 'FashionMNIST', 'KMNIST', 'CIFAR10'
+            num_classes=num_classes,
+            min_size=min_size,
+            max_size=max_size,
+            random_state=random_state,
+        )
+
+    # 4. 保存到文件
+    obj = {
+        "data_u": data_u,
+        "label_prob": label_prob,
+        "labels_real": labels_real,
+        "labels_idx": labels_idx,
+        "dataset_length": dataset_length,
+        "indices_u": indices_u,
+        "input_dim": input_dim,
+        "min_size": min_size,
+        "max_size": max_size,
+        "random_state": random_state,
+    }
+    torch.save(obj, save_path)
+    print(f"[INFO] saved feature bags to {save_path}")
+
+    return data_u, label_prob, labels_real, labels_idx, dataset_length, indices_u, input_dim
+def make_feature_bags_variable_size(
+    data,
+    labels,
+    dataset,
+    num_classes,
+    min_size=16,
+    max_size=256,
+    random_state=0,
+):
+    """
+    模仿 llp_vat 里 kmeans_creation 的思路，用 PCA + MiniBatchKMeans 把实例聚成 bag。
+
+    返回：
+        data_u:      list[list[sample]]，每个元素是一个 bag 里的样本
+        label_prob:  list[list[float]]，每个 bag 的标签比例
+        labels_real: list[np.array]，每个 bag 里的真实标签
+        labels_idx:  list[np.array]，每个 bag 对应的原始索引
+        dataset_length: int，总样本数
+        indices_u:   list[int]，bag 的编号（0,1,2,...）
+        input_dim:   int，单个样本展平后的维度
+    """
+
+    dataset_length = len(data)
+    N = dataset_length
+
+    # 没有足够样本就直接整个当一个 bag
+    if N <= min_size:
+        input_dim = int(np.prod(data.shape[1:]))
+        idx_arr = np.arange(N)
+
+        # reshape 跟你原来的逻辑保持一致
+        if dataset in ['MNIST', 'FashionMNIST', 'EMNISTBalanced', 'KMNIST']:
+            bag_data = [data[i].reshape(28, 28) for i in idx_arr]
+        elif dataset in [
+            'SVHN', 'TinyImageNet', 'Corel16k', 'Corel5k',
+            'Delicious', 'Bookmarks', 'Eurlex_DC', 'Eurlex_SM',
+            'Scene', 'Yeast', 'miniImageNet'
+        ]:
+            bag_data = [data[i] for i in idx_arr]
+        else:
+            bag_data = [data[i].reshape(3, 32, 32).transpose(1, 2, 0)
+                        for i in idx_arr]
+
+        bag_labels = np.array([labels[i] for i in idx_arr])
+        label_counts = Counter(bag_labels)
+        label_counts = OrderedDict(sorted(label_counts.items()))
+        label_proportions = [
+            label_counts.get(c, 0) / len(bag_labels)
+            for c in range(num_classes)
+        ]
+
+        return (
+            [bag_data],              # data_u
+            [label_proportions],     # label_prob
+            [bag_labels],            # labels_real
+            [idx_arr],               # labels_idx
+            dataset_length,
+            [0],                     # indices_u
+            input_dim,
+        )
+
+    # -------------------------
+    # 1. 打乱
+    # -------------------------
+    indices = np.arange(dataset_length)
+    np.random.shuffle(indices)
+    data = data[indices]
+    labels = labels[indices]
+
+    input_dim = int(np.prod(data.shape[1:]))
+
+    # -------------------------
+    # 2. 展平 + PCA
+    # -------------------------
+    data_flat = data.reshape(N, -1).astype(np.float32)
+    if data_flat.max() > 1.5:  # 像素归一化
+        data_flat /= 255.0
+
+    # 模仿你之前的设置：MNIST 系列 64，其它 128
+    if dataset in ["MNIST", "FashionMNIST", "EMNISTBalanced", "KMNIST"]:
+        reduction = 64
+    else:
+        reduction = 128
+
+    pca = PCA(n_components=reduction, random_state=random_state)
+    X_new = pca.fit_transform(data_flat)  # (N, reduction)
+    print(f"PCA-{reduction} done: N={N}, dataset={dataset}")
+
+    # -------------------------
+    # 3. 选 n_clusters
+    #    如果设置了 TARGET_UNIFORM_BAGSIZE：
+    #        n_clusters ≈ N // TARGET_UNIFORM_BAGSIZE
+    #    否则使用 avg_size 方案
+    # -------------------------
+    global TARGET_UNIFORM_BAGSIZE
+
+    if TARGET_UNIFORM_BAGSIZE is not None:
+        bs = max(1, int(TARGET_UNIFORM_BAGSIZE))
+        n_clusters = max(1, N // bs)
+    else:
+        avg_size = (min_size + max_size) / 2.0
+        n_clusters = max(1, int(round(N / avg_size)))
+        max_reasonable_k = max(1, N // min_size)
+        n_clusters = min(n_clusters, max_reasonable_k, N)
+
+    print(f"KMeans: N={N}, n_clusters={n_clusters}, "
+          f"min_size={min_size}, max_size={max_size}, "
+          f"TARGET_UNIFORM_BAGSIZE={TARGET_UNIFORM_BAGSIZE}")
+
+    # MiniBatchKMeans，模仿原代码里的 init_size 写法
+    rng = np.random.RandomState(random_state)
+    init_size = max(3 * n_clusters, 300)
+    kmeans = MiniBatchKMeans(
+        n_clusters=n_clusters,
+        random_state=rng,
+        init_size=init_size,
+        batch_size=1024,
+        n_init=5,
+        max_iter=100,
+        verbose=0,
+    )
+    kmeans.fit(X_new)
+    bag_labels = kmeans.predict(X_new)  # (N,)
+
+    # -------------------------
+    # 4. 按 cluster label 分组（模仿 kmeans_creation）
+    # -------------------------
+    pairs = sorted(
+        zip(bag_labels, range(N)),
+        key=lambda x: x[0]
+    )
+    # 初始簇 -> 初始 bag（还没做 min/max 约束）
+    initial_bags = [
+        [idx for _, idx in group]
+        for _, group in groupby(pairs, key=lambda x: x[0])
+    ]
+
+    # -------------------------
+    # 5. 对 initial_bags 做 [min_size, max_size] 约束
+    # -------------------------
+    final_bags = []
+    small_indices = []
+
+    for bag in initial_bags:
+        idx_arr = np.array(bag, dtype=int)
+        np.random.shuffle(idx_arr)
+        size = len(idx_arr)
+
+        if size < min_size:
+            small_indices.extend(idx_arr.tolist())
+        elif size <= max_size:
+            final_bags.append(idx_arr)
+        else:
+            # 拆大簇
+            num_splits = int(np.ceil(size / max_size))
+            splits = np.array_split(idx_arr, num_splits)
+            for sp in splits:
+                if len(sp) < min_size:
+                    small_indices.extend(sp.tolist())
+                else:
+                    final_bags.append(sp)
+
+    if len(small_indices) > 0:
+        small_indices = np.array(small_indices, dtype=int)
+        np.random.shuffle(small_indices)
+        num_splits = int(np.ceil(len(small_indices) / max_size))
+        splits = np.array_split(small_indices, num_splits)
+        for sp in splits:
+            if len(sp) < min_size:
+                continue
+            final_bags.append(sp)
+
+    print(f"Total bags after size adjustment: {len(final_bags)}")
+
+    # -------------------------
+    # 6. 按你原来 random-bag 的风格构造返回值
+    # -------------------------
+    data_u = []
+    label_prob = []
+    labels_real = []
+    labels_idx = []
+    indices_u = []
+
+    num_classes = int(num_classes)
+
+    for j, idx_arr in enumerate(final_bags):
+        idx_arr = np.array(idx_arr, dtype=int)
+
+        if dataset in ['MNIST', 'FashionMNIST', 'EMNISTBalanced', 'KMNIST']:
+            bag_data = [data[i].reshape(28, 28) for i in idx_arr]
+        elif dataset in [
+            'SVHN',
+            'TinyImageNet',
+            'Corel16k',
+            'Corel5k',
+            'Delicious',
+            'Bookmarks',
+            'Eurlex_DC',
+            'Eurlex_SM',
+            'Scene',
+            'Yeast',
+            'miniImageNet'
+        ]:
+            bag_data = [data[i] for i in idx_arr]
+        else:
+            # CIFAR 之类： (3,32,32) -> (32,32,3)
+            bag_data = [data[i].reshape(3, 32, 32).transpose(1, 2, 0)
+                        for i in idx_arr]
+
+        bag_labels = np.array([labels[i] for i in idx_arr])
+        labels_real.append(bag_labels)
+        labels_idx.append(idx_arr)
+
+        label_counts = Counter(bag_labels)
+        label_counts = OrderedDict(sorted(label_counts.items()))
+        label_proportions = [
+            label_counts.get(c, 0) / len(bag_labels)
+            for c in range(num_classes)
+        ]
+
+        data_u.append(bag_data)
+        label_prob.append(label_proportions)
+        indices_u.append(j)
+
+    return (
+        data_u,
+        label_prob,
+        labels_real,
+        labels_idx,
+        dataset_length,
+        indices_u,
+        input_dim,
+    )
+def generate_five_feature_bag_files(
+    data,
+    labels,
+    dataset,        # 'KMNIST' / 'FashionMNIST' / 'CIFAR10'
+    num_classes,
+    save_root="./data",
+    bag_size_list=(16, 32, 64, 128, 256),
+    min_size=16,
+    max_size=256,
+    random_state=0,
+):
+    """
+    一次性生成 5 种不同的 KMeans-bag 划分，并各自保存成一个文件。
+    文件名格式示例： KMNIST_kmeans_bs16_ms16_mx256_rs0.pt
+    """
+
+    os.makedirs(save_root, exist_ok=True)
+
+    global TARGET_UNIFORM_BAGSIZE
+
+    for bs in bag_size_list:
+        # 设定这一次聚类要对齐的“uniform bag size”
+        TARGET_UNIFORM_BAGSIZE = bs
+
+        print(f"\n[INFO] Generating feature bags: "
+              f"dataset={dataset}, target_uniform_bagsize={bs}")
+
+        data_u, label_prob, labels_real, labels_idx, dataset_length, indices_u, input_dim = \
+            make_feature_bags_variable_size(
+                data=data,
+                labels=labels,
+                dataset=dataset,   # 例如 'FashionMNIST', 'KMNIST', 'CIFAR10'
+                num_classes=num_classes,
+                min_size=min_size,
+                max_size=max_size,
+                random_state=random_state,
+            )
+
+        scheme = f"kmeans_bs{bs}_ms{min_size}_mx{max_size}_rs{random_state}"
+        save_path = os.path.join(save_root, f"{dataset}_{scheme}.pt")
+
+        torch.save(
+            {
+                "data_u": data_u,
+                "label_prob": label_prob,
+                "labels_real": labels_real,
+                "labels_idx": labels_idx,
+                "dataset_length": dataset_length,
+                "indices_u": indices_u,
+                "input_dim": input_dim,
+                "bagsize_tag": bs,
+            },
+            save_path,
+        )
+
+        print(f"[INFO] Saved feature bags to {save_path}")
 
 def extract_labels_from_class_dict(class_dict):
     for class_idx, image_indices in enumerate(class_dict.values()):
@@ -232,31 +633,13 @@ class ThreeCropsTransform:
 
 
 
-def load_data_train(args,num_classes, dataset='CIFAR10', dspth='./data', bagsize=16):
-    """
-    不改变接口与返回值：
-      return data_u, label_prob, labels_real, labels_idx, dataset_length, indices_u, input_dim
-
-    现在只用 1 个参数（Dirichlet 总浓度 alpha0）控制“主导程度”：
-      - alpha0 越小（<1）：越容易出现某一个簇权重很大 -> bag 更“被一个簇主导”
-      - alpha0 越大（>1）：越均匀 -> bag 更混
-
-    严格全局无放回：
-      - 同一个样本不会出现在不同 bag（也不会在同一个 bag 里重复）
-    """
-    import os.path as osp
-    import numpy as np
-    import pickle
-    from collections import Counter, OrderedDict
-
-    input_dim = 1
-
-    # -----------------------------
-    # 1) 读取原始数据（保持你原来的风格）
-    # -----------------------------
+def load_data_train(num_classes, dataset='CIFAR10', dspth='./data', bagsize=16):
+    input_dim=1
     if dataset == 'Corel16k':
-        datalist = [osp.join(dspth, f'Corel16k{idx:03d}-train.arff') for idx in range(1, 11)]
-        n_class = 374
+        # Corel16k 有 10 个子集（001–010）
+        datalist = [osp.join(dspth, f'Corel16k{idx:03d}-train.arff')
+                    for idx in range(1, 11)]
+        n_class = 374  # Corel 系列常用 374 标签
     elif dataset == 'Corel5k':
         datalist = [osp.join(dspth, 'Corel5k-train.arff')]
         n_class = 374
@@ -264,14 +647,18 @@ def load_data_train(args,num_classes, dataset='CIFAR10', dspth='./data', bagsize
         datalist = [osp.join(dspth, 'delicious-train.arff')]
         n_class = 983
     elif dataset == 'Bookmarks':
-        datalist = [osp.join(dspth, 'bookmarks.arff')]
+        datalist = [osp.join(dspth, 'bookmarks.arff')]  # bookmarks 只有一个 ARFF
         n_class = 208
     elif dataset == 'Eurlex_DC':
-        datalist = [osp.join(dspth, f'eurlex-dc-leaves-fold{i}-train.arff') for i in range(1, 11)]
-        n_class = 201
+        # 10-fold 划分的 Directory-Codes 版本
+        datalist = [osp.join(dspth,
+                             f'eurlex-dc-leaves-fold{i}-train.arff') for i in range(1, 11)]
+        n_class = 201  # Eurlex-DC (leaves) 共有 201 类
     elif dataset == 'Eurlex_SM':
-        datalist = [osp.join(dspth, f'eurlex-sm-fold{i}-train.arff') for i in range(1, 11)]
-        n_class = 281
+        # 10-fold 划分的 Subject-Matters 版本
+        datalist = [osp.join(dspth,
+                             f'eurlex-sm-fold{i}-train.arff') for i in range(1, 11)]
+        n_class = 281  # Eurlex-SM 共有 281 类
     elif dataset == 'Scene':
         datalist = [osp.join(dspth, 'scene-train.arff')]
         n_class = 6
@@ -279,10 +666,14 @@ def load_data_train(args,num_classes, dataset='CIFAR10', dspth='./data', bagsize
         datalist = [osp.join(dspth, 'yeast-train.arff')]
         n_class = 14
     elif dataset == 'CIFAR10':
-        datalist = [osp.join(dspth, 'cifar-10-batches-py', f'data_batch_{i+1}') for i in range(5)]
+        datalist = [
+            osp.join(dspth, 'cifar-10-batches-py', 'data_batch_{}'.format(i + 1))
+            for i in range(5)
+        ]
         n_class = 10
     elif dataset == 'CIFAR100':
-        datalist = [osp.join(dspth, 'cifar-100-python', 'train')]
+        datalist = [
+            osp.join(dspth, 'cifar-100-python', 'train')]
         n_class = 100
     elif dataset == 'SVHN':
         data, labels= load_svhn_data(dspth)
@@ -298,21 +689,52 @@ def load_data_train(args,num_classes, dataset='CIFAR10', dspth='./data', bagsize
         n_class = 10
     elif dataset == 'KMNIST':
         data, labels = [], []
-        datalist = [osp.join(dspth, 'KMNIST', 'raw', 'train-images-idx3-ubyte')]
-        labelslist = [osp.join(dspth, 'KMNIST', 'raw', 'train-labels-idx1-ubyte')]
+        datalist = [
+            osp.join(dspth, 'KMNIST', 'raw', 'train-images-idx3-ubyte'),
+        ]
+        labelslist = [
+            osp.join(dspth, 'KMNIST', 'raw', 'train-labels-idx1-ubyte'),
+        ]
         n_class = 10
     elif dataset == 'EMNISTBalanced':
         data, labels = [], []
-        datalist = [osp.join(dspth, 'EMNIST', 'raw', 'emnist-balanced-train-images-idx3-ubyte')]
-        labelslist = [osp.join(dspth, 'EMNIST', 'raw', 'emnist-balanced-train-labels-idx1-ubyte')]
+        # 更新文件路径以指向EMNIST Balanced数据集的文件
+        datalist = [osp.join(dspth, 'EMNIST','raw', 'emnist-balanced-train-images-idx3-ubyte')]
+        labelslist = [osp.join(dspth, 'EMNIST','raw', 'emnist-balanced-train-labels-idx1-ubyte')]
         n_class = 47
-    elif dataset in ['AGNEWS', 'TinyImageNet', 'miniImageNet']:
-        raise ValueError(f"{dataset} loader not provided in this snippet.")
+    elif dataset == 'AGNEWS':
+        data, labels = [], []
+        datalist = [
+            osp.join(dspth, 'AGNEWS', 'train.csv'),  # 训练集
+            osp.join(dspth, 'AGNEWS', 'test.csv')  # 测试集
+        ]
+        labelslist = None  # AG News 数据集的标签已经嵌入文件中
+        n_class = 4
+    elif dataset == 'TinyImageNet':
+        train_data, train_labels, n_class = load_tiny_imagenet_data(dspth)
+    elif dataset == 'miniImageNet':
+
+        train_data, train_labels = merge_train_val_test(dspth)
+        subset_data_list = []
+        subset_labels_list = []
+
+        n_class = 100
+        for i in range(0, len(train_data), 600):
+            # Get the first 500 samples from the current chunk
+            chunk_data = train_data[i:i + 600][:500]
+            chunk_labels = np.array(train_labels[i:i + 600][:500])
+
+            # Append the data and labels to the lists
+            subset_data_list.append(chunk_data)
+            subset_labels_list.append(chunk_labels)
+
+        # Concatenate the subsets into final arrays
+        train_data = np.concatenate(subset_data_list, axis=0)
+        train_labels = np.concatenate(subset_labels_list, axis=0)
     else:
         raise ValueError("Unsupported dataset")
 
-    # ---------- 读取具体数据 ----------
-    if dataset in ['CIFAR10', 'CIFAR100']:
+    if dataset == 'CIFAR10' or dataset == 'CIFAR100':
         data, labels = [], []
         for data_batch in datalist:
             with open(data_batch, 'rb') as fr:
@@ -322,288 +744,157 @@ def load_data_train(args,num_classes, dataset='CIFAR10', dspth='./data', bagsize
                 labels.append(lbs)
         data = np.concatenate(data, axis=0)
         labels = np.concatenate(labels, axis=0)
-
         if n_class == 2:
+            # 机器类映射为 1，其余为 0
             machine_classes = np.array([0, 1, 8, 9])
             labels = np.isin(labels, machine_classes).astype(np.int64)
-
     elif dataset in ['MNIST']:
         for data_path, label_path in zip(datalist, labelslist):
             with open(data_path, 'rb') as fr_data, open(label_path, 'rb') as fr_label:
-                fr_data.read(16)
-                fr_label.read(8)
+                fr_data.read(16)  # Skip the header
+                fr_label.read(8)  # Skip the header
                 data.append(np.frombuffer(fr_data.read(), dtype=np.uint8).reshape(-1, 784))
                 labels.append(np.frombuffer(fr_label.read(), dtype=np.uint8))
         data = np.concatenate(data, axis=0)
         labels = np.concatenate(labels, axis=0)
         if n_class == 2:
             labels = np.where(np.isin(labels, [0, 2, 4, 6, 8]), 0, 1)
-
-    elif dataset in ['FashionMNIST', 'KMNIST', 'EMNISTBalanced']:
+    elif dataset in ['FashionMNIST']:
         for data_path, label_path in zip(datalist, labelslist):
             with open(data_path, 'rb') as fr_data, open(label_path, 'rb') as fr_label:
-                fr_data.read(16)
-                fr_label.read(8)
+                fr_data.read(16)  # Skip the header
+                fr_label.read(8)  # Skip the header
+                data.append(np.frombuffer(fr_data.read(), dtype=np.uint8).reshape(-1, 784))
+                labels.append(np.frombuffer(fr_label.read(), dtype=np.uint8))
+        data = np.concatenate(data, axis=0)
+        labels = np.concatenate(labels, axis=0)
+    elif dataset in ['KMNIST']:
+
+        for data_path, label_path in zip(datalist, labelslist):
+            with open(data_path, 'rb') as fr_data, open(label_path, 'rb') as fr_label:
+                fr_data.read(16)  # Skip the header
+                fr_label.read(8)  # Skip the header
                 data.append(np.frombuffer(fr_data.read(), dtype=np.uint8).reshape(-1, 784))
                 labels.append(np.frombuffer(fr_label.read(), dtype=np.uint8))
         data = np.concatenate(data, axis=0)
         labels = np.concatenate(labels, axis=0)
 
-    elif dataset in ['Corel16k','Corel5k','Delicious','Bookmarks','Eurlex_DC','Eurlex_SM','Scene','Yeast']:
+
+    elif dataset == 'EMNISTBalanced':
+        for data_path, label_path in zip(datalist, labelslist):
+            with open(data_path, 'rb') as fr_data, open(label_path, 'rb') as fr_label:
+                fr_data.read(16)  # 跳过头部信息
+                fr_label.read(8)  # 跳过头部信息
+                data.append(np.frombuffer(fr_data.read(), dtype=np.uint8).reshape(-1, 784))
+                labels.append(np.frombuffer(fr_label.read(), dtype=np.uint8))
+
+        data = np.concatenate(data, axis=0)
+        labels = np.concatenate(labels, axis=0)
+    elif dataset == 'TinyImageNet':
+        data=train_data
+        labels=train_labels
+    elif dataset == 'miniImageNet':
+        data = train_data
+        labels = train_labels
+    elif dataset in [
+            'Corel16k',  # 10 × Corel16kXXX-train.arff
+            'Corel5k',
+            'Delicious',
+            'Bookmarks',
+            'Eurlex_DC',  # eurlex-dc-leaves-fold*-train.arff
+            'Eurlex_SM',  # eurlex-sm-fold*-train.arff
+            'Scene',
+            'Yeast'
+        ]:
         import pandas as pd
         from scipy.io import arff
 
         data_parts, label_parts = [], []
+
+        # -------- 1. 逐文件读入 --------
         for arff_path in datalist:
             raw, _ = arff.loadarff(arff_path)
             df = pd.DataFrame(raw)
 
-            X_part = df.iloc[:, :-n_class].values.astype(np.float32)
+            X_part = df.iloc[:, :-n_class].values.astype(np.float32)  # 特征
             Y_part = (df.iloc[:, -n_class:]
                       .applymap(lambda x: int(x.decode() if isinstance(x, bytes) else x))
-                      .values.astype(np.int32))
+                      .values.astype(np.int32))  # 多热标签
 
             data_parts.append(X_part)
             label_parts.append(Y_part)
 
-        data = np.concatenate(data_parts, axis=0)
-        labels = np.concatenate(label_parts, axis=0)
+        data = np.concatenate(data_parts, axis=0)  # [N, D]
+        labels = np.concatenate(label_parts, axis=0)  # [N, K]
 
-        if labels.shape[1] > 15:
-            freq = labels.sum(axis=0)
-            keep_idx = np.argsort(freq)[::-1][:15]
+        # -------- 2. 过滤低频标签 --------
+        if labels.shape[1] > 15:  # 只在标签数 > 15 时执行
+            freq = labels.sum(axis=0)  # 每个标签出现次数
+            keep_idx = np.argsort(freq)[::-1][:15]  # 取出现频次最高的 15 个
             remove_idx = np.setdiff1d(np.arange(labels.shape[1]), keep_idx)
 
+            # (i) 删除在被移除标签上有正标记的样本
             mask_samples = (labels[:, remove_idx].sum(axis=1) == 0)
             data = data[mask_samples]
             labels = labels[mask_samples]
+
+            # (ii) 只保留 15 列标签
             labels = labels[:, keep_idx]
 
         n_class = labels.shape[1]
         input_dim = data.shape[1]
 
-    # -----------------------------
-    # 2) 用聚类簇来生成 bag（严格无放回）
-    # -----------------------------
-    dataset_length = len(data)
-    num_bags = dataset_length // bagsize
-    data_length = num_bags * bagsize
+    elif dataset == 'AGNEWS':
+        for data_path in datalist:
+            with open(data_path, 'r', encoding='utf-8') as fr:
+                df = pd.read_csv(fr, header=None, names=["Class", "Title", "Description"])
+                data.append((df["Title"] + " " + df["Description"]).tolist())
+                labels.append((df["Class"] - 1).tolist())
 
-    # 全长打乱再截断：保证参与造 bag 的样本是唯一的一批（不会重复）
-    perm_all = np.arange(dataset_length)
-    np.random.shuffle(perm_all)
-    perm = perm_all[:data_length]
+        data = np.concatenate(data, axis=0)
+        labels = np.concatenate(labels, axis=0)
 
-    data = data[perm]
-    labels = labels[perm]
+    dataset_length=len(data)
+    num_bags = len(data) // bagsize
+    data_length=num_bags*bagsize
+    random_indices = np.arange(data_length)
+    np.random.shuffle(random_indices)
 
-    # ---- 读取 cluster map（必须提前生成）----
-    def _find_cluster_npz(_dspth, _dataset):
-        base = osp.join(_dspth, "cluster_maps")
-        if _dataset == "CIFAR100":
-            candidates = [256, 128, 64]
-        else:
-            candidates = [32, 64]
-        for K in candidates:
-            p = osp.join(base, f"{_dataset}_train_K{K}.npz")
-            if osp.exists(p):
-                return p
-        raise FileNotFoundError(
-            f"Cannot find cluster map for {_dataset} under {base}. "
-            f"Expected like {_dataset}_train_K32.npz / {_dataset}_train_K256.npz"
-        )
-
-    cluster_npz = _find_cluster_npz(dspth, dataset)
-    z = np.load(cluster_npz, allow_pickle=True)
-    clusters_all = z["clusters"].astype(np.int64)  # 原始顺序 cluster id
-    clusters = clusters_all[perm]                  # 对齐 data/labels 的重排截断
-
-    # ---- 建立每簇池：pool 是“可用样本索引列表”，取过就不会再用 ----
-    rng = np.random.default_rng()
-    pools = {}
-    for i, c in enumerate(clusters):
-        pools.setdefault(int(c), []).append(i)
-    # 转 numpy 并 shuffle
-    for c in list(pools.keys()):
-        arr = np.array(pools[c], dtype=np.int64)
-        rng.shuffle(arr)
-        pools[c] = arr
-
-    ptr = {c: 0 for c in pools.keys()}  # 每簇取样指针
-
-    def remaining(c: int) -> int:
-        return int(len(pools[c]) - ptr[c])
-
-    def take(c: int, k: int) -> np.ndarray:
-        """从簇 c 无放回取 k 个（若不够会自动取剩余全部）"""
-        rem = remaining(c)
-        k = min(k, rem)
-        s = ptr[c]
-        e = s + k
-        ptr[c] = e
-        return pools[c][s:e]
-
-    cluster_ids_all = np.array(sorted(pools.keys()), dtype=np.int64)
-
-    # -----------------------------
-    # 只用一个参数：Dirichlet 总浓度 alpha0
-    # -----------------------------
-    alpha0 = 1
-    # 建议范围：
-    #   0.1 ~ 0.3: 强主导（一个簇占很多）
-    #   0.5:      中等主导
-    #   1.0:      接近均匀混合（主导不明显）
-
-    def _pi_from_remaining(cluster_ids):
-        """base measure π：按剩余量归一化（更稳，不容易抽到快空的簇）"""
-        rems = np.array([remaining(int(c)) for c in cluster_ids], dtype=np.float64)
-        rems = np.maximum(rems, 0.0)
-        s = rems.sum()
-        if s <= 0:
-            return np.ones(len(cluster_ids), dtype=np.float64) / max(1, len(cluster_ids))
-        return rems / s
-
-    # -----------------------------
-    # 3) 生成 bag：先全局抽 counts 矩阵 C，再严格无放回分配（不需要 deficit）
-    # -----------------------------
+    data = data[random_indices]
+    labels = labels[random_indices]
     data_u, label_prob = [], []
     labels_real = []
     labels_idx = []
-    indices_u = []
+    # data shape: (N, C, H, W)
 
-    cluster_ids_all = np.array(sorted(pools.keys()), dtype=np.int64)
-    K = len(cluster_ids_all)
-    B = num_bags
-    m = bagsize
 
-    cluster_sizes = np.array([len(pools[int(c)]) for c in cluster_ids_all], dtype=np.int64)
-    assert cluster_sizes.sum() == B * m, "Internal error: cluster sizes don't sum to data_length."
+    N = data.shape[0]
+    data_flat = data.reshape(N, -1)  # 展平到 (N, D)
 
-    alpha0 = args.pi
-
-    pi = cluster_sizes.astype(np.float64)
-    pi = pi / pi.sum()
-
-    def _sample_counts_matrix_dirichlet(B, m, alpha0, pi, rng):
-
-        dir_param = np.maximum(alpha0 * pi, 1e-12)
-        W = rng.dirichlet(dir_param, size=B)  # (B, K)
-
-        # 先取 floor
-        F = W * m
-        C = np.floor(F).astype(np.int64)
-        row_sum = C.sum(axis=1)
-        rem = (m - row_sum).astype(np.int64)
-        frac = F - np.floor(F)
-        for b in range(B):
-            r = int(rem[b])
-            if r <= 0:
-                continue
-            p = frac[b].copy()
-            s = p.sum()
-            if s <= 0:
-                p = W[b].copy()
-                p = p / p.sum()
-            else:
-                p = p / s
-            add = rng.choice(np.arange(K), size=r, replace=True, p=p)
-            for k in add:
-                C[b, int(k)] += 1
-
-        assert np.all(C.sum(axis=1) == m)
-        return C
-
-    def _balance_columns_to_targets(C, targets, rng):
-
-        C = C.copy()
-        cur = C.sum(axis=0)
-        diff = targets - cur
-
-        deficit = np.where(diff > 0)[0].tolist()
-        surplus = np.where(diff < 0)[0].tolist()
-
-        max_moves = int(diff[diff > 0].sum())
-        moves = 0
-
-        while deficit:
-            d = deficit[-1]
-            if not surplus:
-                raise RuntimeError("Balancing failed: no surplus but still deficit.")
-            s = surplus[-1]
-
-            candidates = np.where(C[:, s] > 0)[0]
-            if len(candidates) == 0:
-                surplus.pop()
-                continue
-            b = int(rng.choice(candidates))
-
-            C[b, s] -= 1
-            C[b, d] += 1
-
-            diff[s] += 1
-            diff[d] -= 1
-            moves += 1
-            if moves > max_moves + 10 * K:
-                raise RuntimeError("Balancing seems stuck; check inputs.")
-
-            if diff[d] == 0:
-                deficit.pop()
-            if diff[s] == 0:
-                surplus.pop()
-
-        assert np.all(C.sum(axis=0) == targets)
-        assert np.all(C.sum(axis=1) == m)
-        return C
-
-    C0 = _sample_counts_matrix_dirichlet(B, m, alpha0, pi, rng)
-
-    C = _balance_columns_to_targets(C0, cluster_sizes, rng)
-
-    ptr = {int(c): 0 for c in cluster_ids_all}
-
-    for j in range(B):
-        bag_idx_list = []
-        for k, cid in enumerate(cluster_ids_all):
-            need = int(C[j, k])
-            if need <= 0:
-                continue
-            cid = int(cid)
-            s = ptr[cid]
-            e = s + need
-            chosen = pools[cid][s:e]
-            ptr[cid] = e
-            bag_idx_list.extend(chosen.tolist())
-
-        bag_indices = np.array(bag_idx_list, dtype=np.int64)
-        rng.shuffle(bag_indices)
-
-        if dataset in ['MNIST', 'FashionMNIST', 'EMNISTBalanced', 'KMNIST']:
-            bag_data = [data[i].reshape(28, 28) for i in bag_indices]
-        elif dataset == 'SVHN':
-            bag_data = [data[i] for i in bag_indices]
-        elif dataset == 'TinyImageNet':
-            bag_data = [data[i] for i in bag_indices]
-        elif dataset in ['Corel16k', 'Corel5k', 'Delicious', 'Bookmarks', 'Eurlex_DC', 'Eurlex_SM', 'Scene', 'Yeast']:
-            bag_data = [data[i] for i in bag_indices]
-        elif dataset == 'miniImageNet':
-            bag_data = [data[i] for i in bag_indices]
-        else:
-            bag_data = [data[i].reshape(3, 32, 32).transpose(1, 2, 0) for i in bag_indices]
-
-        bag_labels = np.array([labels[i] for i in bag_indices])
-        labels_real.append(bag_labels)
-        labels_idx.append(bag_indices)
-
-        label_counts = Counter(bag_labels)
-        label_counts = OrderedDict(sorted(label_counts.items()))
-        label_proportions = [
-            label_counts.get(label, 0) / len(bag_labels)
-            for label in range(0, num_classes)
-        ]
-
-        data_u.append(bag_data)
-        indices_u.append(j)
-        label_prob.append(label_proportions)
+    pca_dim = 64 if dataset in ["FashionMNIST", "KMNIST"] else 128
+    pca = PCA(n_components=pca_dim)
+    data_pca = pca.fit_transform(data_flat)
+    data_u, label_prob, labels_real, labels_idx, dataset_length, indices_u, input_dim = \
+        get_feature_bags_and_cache(
+            data=data,
+            labels=labels,
+            dataset=dataset,  # 例如 'FashionMNIST', 'KMNIST', 'CIFAR10'
+            num_classes=num_classes,
+            min_size=16,
+            max_size=256,
+            random_state=0,
+        )
+    generate_five_feature_bag_files(
+        data=data,
+        labels=labels,
+        dataset=dataset,  # 'KMNIST' / 'FashionMNIST' / 'CIFAR10'
+        num_classes=num_classes,
+        save_root="./data",
+        bag_size_list=(16, 32, 64, 128, 256),
+        min_size=16,
+        max_size=256,
+        random_state=0,
+    )
 
     return data_u, label_prob, labels_real, labels_idx, dataset_length, indices_u, input_dim
 
@@ -619,7 +910,7 @@ def load_data_val(dataset, dspth='./data',n_classes=10):
         ]
     elif dataset == 'Corel16k':
         datalist = [osp.join(dspth, f'Corel16k{idx:03d}-test.arff')
-                    for idx in range(1, 11)]
+                    for idx in range(1, 11)]  # 一共有 10 个子集
     elif dataset == 'Corel5k':
         datalist = [osp.join(dspth, 'Corel5k-test.arff')]
 
@@ -627,7 +918,7 @@ def load_data_val(dataset, dspth='./data',n_classes=10):
         datalist = [osp.join(dspth, 'delicious-test.arff')]
 
     elif dataset == 'Bookmarks':
-        datalist = [osp.join(dspth, 'bookmarks.arff')]
+        datalist = [osp.join(dspth, 'bookmarks.arff')]  # 原数据即 train+test，若你有拆分请自行替换
 
     elif dataset == 'Eurlex_DC':
         datalist = [osp.join(dspth,
@@ -1258,8 +1549,61 @@ class SVHN(Dataset):
         return leng
 
 
-def get_train_loader(args,classes,dataset, batch_size, bag_size, root='data', method='co',supervised=False):
-    data_u, label_prob, labels,label_idx,dataset_length,indices_u,input_dim = load_data_train(args,classes, dataset=dataset, dspth=root, bagsize=bag_size)
+def load_clustered_data_train(
+    num_classes,
+    dataset='CIFAR10',     # 'CIFAR10' / 'KMNIST' / 'FashionMNIST'
+    dspth='./data',
+    bagsize=16,            # 对应你当时生成文件时的 bs: 16,32,64,128,256
+    min_size=16,
+    max_size=256,
+    random_state=0,
+):
+    """
+    直接从已经保存好的聚类 .pt 文件中加载：
+        data_u, label_prob, labels_real, labels_idx,
+        dataset_length, indices_u, input_dim
+
+    文件名假定为：
+        {dspth}/{dataset}_kmeans_bs{bagsize}_ms{min_size}_mx{max_size}_rs{random_state}.pt
+    """
+
+    # 只对 CIFAR10 / KMNIST / FashionMNIST 使用聚类版
+    assert dataset in ['CIFAR10', 'KMNIST', 'FashionMNIST'], \
+        f"load_clustered_data_train 目前只支持 CIFAR10 / KMNIST / FashionMNIST, got {dataset}"
+
+    scheme = f"kmeans_bs{bagsize}_ms{min_size}_mx{max_size}_rs{random_state}"
+    save_path = os.path.join(dspth, f"{dataset}_{scheme}.pt")
+
+    if not os.path.exists(save_path):
+        raise FileNotFoundError(
+            f"聚类文件不存在: {save_path}\n"
+            f"请先用 generate_five_feature_bag_files 生成该划分方案。"
+        )
+
+    print(f"[INFO] load clustered feature bags from {save_path}")
+    obj = torch.load(save_path, map_location="cpu")
+
+    data_u      = obj["data_u"]
+    label_prob  = obj["label_prob"]
+    labels_real = obj["labels_real"]
+    labels_idx  = obj["labels_idx"]
+    dataset_len = obj["dataset_length"]
+    indices_u   = obj["indices_u"]
+    input_dim   = obj["input_dim"]
+
+    # 返回接口不变
+    return data_u, label_prob, labels_real, labels_idx, dataset_len, indices_u, input_dim
+
+
+def get_train_loader(classes,dataset, batch_size, bag_size, root='data', method='co',supervised=False):
+    #data_u, label_prob, labels,label_idx,dataset_length,indices_u,input_dim = load_data_train(classes, dataset=dataset, dspth=root, bagsize=bag_size)
+    data_u, label_prob, labels, label_idx, dataset_length, indices_u, input_dim = \
+        load_clustered_data_train(
+            classes, dataset=dataset, dspth=root, bagsize=bag_size,
+            min_size=16,
+            max_size=256,
+            random_state=0,
+        )
     if dataset != 'SVHN':
         ds_u = Cifar(
                 dataset=dataset,
@@ -1282,12 +1626,17 @@ def get_train_loader(args,classes,dataset, batch_size, bag_size, root='data', me
         )
     #sampler_u = RandomSampler(ds_u, replacement=True, num_samples=mu * n_iters_per_epoch * batch_size)
     sampler_u = RandomSampler(ds_u, replacement=False)
-    batch_sampler_u = BatchSampler(sampler_u, batch_size, drop_last=True)
+
+    batch_size_u = 4  # 你想要的「一个 batch 里有多少个 bag」
+
     dl_u = torch.utils.data.DataLoader(
         ds_u,
-        batch_sampler=batch_sampler_u,
-        num_workers=16,
-        pin_memory=True
+        batch_size=batch_size,  # 用 batch_size，不要 batch_sampler 了
+        sampler=sampler_u,
+        drop_last=True,  # 跟原来 BatchSampler 的 drop_last 一样效果
+        num_workers=16,  # 先 0 调试，OK 了再开 16
+        pin_memory=True,
+        collate_fn=collate_u,
     )
     return dl_u,dataset_length,input_dim
 
