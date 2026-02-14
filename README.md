@@ -54,6 +54,7 @@ warmup_ratio = warmup_lr / lr
 | Argument      | Type | Default  | Description                                                         |
 | ------------- | ---- | -------- | ------------------------------------------------------------------- |
 | `--pl_method` | str  | `random` | Bag-generation strategy. Options: `random`, `cluster`, `alphafirst` |
+| `--pi`        | str  | `10`     | Bag purity / concentration control for `alphafirst` and `cluster`. Smaller `pi` ⇒ more homogeneous bags; larger `pi` ⇒ more mixed bags. |
 ---
 
 ## Experiment Management
