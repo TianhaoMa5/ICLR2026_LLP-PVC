@@ -23,7 +23,7 @@ This project supports the following command-line arguments for training.
 | ------------ | ----- | -------- | ------------------------------------------------ |
 | `--lr`       | float | `2.5e-3` | Learning rate                                    |
 | `--momentum` | float | `0.9`    | Momentum for optimizer                           |
-| `--eps`      | float | `1e-30`  | Numerical stability epsilon                      |
+| `--eps`      | double | `1e-30`  | Numerical stability epsilon                      |
 | `--seed`     | int   | `13`     | Random seed (negative value disables fixed seed) |
 
 ---
