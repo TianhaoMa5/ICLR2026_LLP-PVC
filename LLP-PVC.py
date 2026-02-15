@@ -865,7 +865,7 @@ def main ():
     help ='c oefficient of unlabeled loss')
     parser .add_argument ('--lr',type =float ,default= 2.5e-3 ,
     help ='learning rate for training')
-    parser.add_argument('--eps', type=float, default=1e-30,
+    parser.add_argument('--eps', type=double, default=1e-30,
                         help='numerical stability epsilon')
     parser .add_argument ('--momentum',type =float ,default =0.9 ,
     help ='momentum for optimizer')
