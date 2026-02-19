@@ -685,8 +685,9 @@ samp_ran
             scores ,lbs_u_guess =torch .max (probs ,dim =1 )
             mask =scores .ge (args .thr ).float ()
 
-
-            probs1 =torch .softmax (logits_u_w ,dim =1 ).detach()
+            eps = 1e-6
+            probs1 = torch.softmax(logits_u_w, dim=1).detach()
+            probs1 = probs1.clamp(min=eps, max=1.0 - eps)
             entropy = -(probs1 * probs1.log()).sum(dim=-1)  # shape: [batch_size]
         # (Optional) average entropy over the batch
         x =1
