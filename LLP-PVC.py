@@ -270,6 +270,28 @@ def proportions_to_counts_exact(
         k[j] += diff
     k = torch.clamp(k, 0, s)
     return k
+def proportions_to_counts_exact_vmap(
+    proportions: torch.Tensor,  # [C]
+    s: int,
+) -> torch.Tensor:
+    # round to nearest integer counts
+    k = torch.round(proportions * float(s)).to(torch.long)  # [C]
+
+    # tensor scalar diff (no .item())
+    diff = (s - k.sum()).to(torch.long)  # 0-dim tensor
+
+    # index of largest proportion (tensor scalar)
+    j = torch.argmax(proportions)        # 0-dim long tensor
+
+    # add diff to k[j] WITHOUT python indexing / item()
+    # (scatter_add expects index to have same dim as src)
+    add = torch.zeros_like(k)
+    add.scatter_(0, j.view(1), diff.view(1))
+    k = k + add
+
+    # clamp to [0, s]
+    k = torch.clamp(k, 0, s)
+    return k
 
 
 # ============================================================
@@ -362,7 +384,7 @@ def compute_CC_loss_fft_precise(
     p = softmax_p.to(dt).t().clamp(min=tiny, max=1.0 - tiny)
 
     # integer targets (do not renorm proportions)
-    k_c = proportions_to_counts_exact(proportions.to(dev), s)  # [C]
+    k_c = proportions_to_counts_exact_vmap(proportions.to(dev), s)  # [C]
 
     # coefficients
     coeffs, log_sc = coeff_product_fast_norm(p)  # [C, s+1], [C]
