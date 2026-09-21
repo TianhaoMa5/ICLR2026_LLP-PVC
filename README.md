@@ -1,3 +1,13 @@
+### Minor Clarification
+
+Within a bag, the feature instances $X_1,\ldots,X_m$ may be statistically dependent. We assume only that the labels are conditionally independent given the instances:
+
+$$
+P(Y_{1:m}\mid X_{1:m}) = \prod_{j=1}^{m} P(Y_j\mid X_j).
+$$
+
+The paper's reference to the “independence of the instances in the bag” should more precisely refer to this conditional independence of the labels given the instances. This wording issue does not affect the derivation under the intended assumption.
+
 # Training Arguments
 
 This project supports the following command-line arguments for training.
